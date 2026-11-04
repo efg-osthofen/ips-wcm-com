@@ -99,25 +99,23 @@ class WCMConnector extends IPSModule {
                     
                         if(strpos($Ident, self::BETRIEBSART_HK_PREFIX) !== false) {
                             $api->bufferedUpdateBetriebsartHK(intval(substr($Ident, strlen(self::BETRIEBSART_HK_PREFIX))), $Value);
-                            SetValue($this->GetIDForIdent($Ident), $Value);
                         } elseif(strpos($Ident, "NormalRaumtemperaturHK") !== false) {
                             $api->bufferedUpdateNormalRaumtemperaturHK(intval(substr($Ident, strlen("NormalRaumtemperaturHK"))), $Value);
-                            SetValue($this->GetIDForIdent($Ident), $Value);
                         }  elseif(strpos($Ident, "RaumfrosttemperaturHK") !== false) {
                             $api->bufferedUpdateRaumfrosttemperaturHK(intval(substr($Ident, strlen("RaumfrosttemperaturHK"))), $Value);
-                            SetValue($this->GetIDForIdent($Ident), $Value);
                         }  elseif(strpos($Ident, "SoWiUmschalttemperaturHK") !== false) {
                             $api->bufferedUpdateSoWiUmschalttemperaturHK(intval(substr($Ident, strlen("SoWiUmschalttemperaturHK"))), $Value);
-                            SetValue($this->GetIDForIdent($Ident), $Value);
                         }  elseif(strpos($Ident, "SteilheitHK") !== false) {
                             $api->bufferedUpdateSteilheitHK(intval(substr($Ident, strlen("SteilheitHK"))), $Value);
-                            SetValue($this->GetIDForIdent($Ident), $Value);
                         } else {
                             throw new Exception("Invalid Ident");
                         }
-                    
+
                         $api->sendBuffer(10);
                         $api->clearBuffer();
+
+                        // Only update the variable once the WCM-COM accepted the new value
+                        SetValue($this->GetIDForIdent($Ident), $Value);
                 }
             } finally {
                 // Always release the semaphore, also on early break or exception
