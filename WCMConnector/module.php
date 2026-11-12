@@ -111,8 +111,7 @@ class WCMConnector extends IPSModule {
                             throw new Exception("Invalid Ident");
                         }
 
-                        $api->sendBuffer(10);
-                        $api->clearBuffer();
+                        $this->SendWriteBuffer($api);
 
                         // Only update the variable once the WCM-COM accepted the new value
                         SetValue($this->GetIDForIdent($Ident), $Value);
@@ -131,16 +130,28 @@ class WCMConnector extends IPSModule {
         $api = new Weishaupt(new WeishauptOptions($this->ReadPropertyString("URL"), $this->ReadPropertyString("Username"), $this->ReadPropertyString("Password")));
 
         $api->bufferedUpdateMaxLeistungHeizung($maxLeistung);
-        $api->sendBuffer(10);
-        $api->clearBuffer();
+        $this->SendWriteBuffer($api);
     }
 
     public function UpdateWCMMaxLeistungWW(int $maxLeistung) {
         $api = new Weishaupt(new WeishauptOptions($this->ReadPropertyString("URL"), $this->ReadPropertyString("Username"), $this->ReadPropertyString("Password")));
 
         $api->bufferedUpdateMaxLeistungWW($maxLeistung);
-        $api->sendBuffer(10);
+        $this->SendWriteBuffer($api);
+    }
+
+    /**
+     * Sends buffered write telegrams and fails if the WCM-COM rejected any of them.
+     */
+    private function SendWriteBuffer(Weishaupt $api) {
+        $response = $api->sendBuffer(10);
         $api->clearBuffer();
+
+        foreach($response->getIterator() as $telegram) {
+            if($telegram->ERROR) {
+                throw new Exception("WCM-COM rejected the write request for INFONR ".$telegram->INFONR.".");
+            }
+        }
     }
 
     public function RetrieveWCMStatus(bool $sendBuffer = true) {
@@ -188,6 +199,10 @@ class WCMConnector extends IPSModule {
         
         foreach($bufferPositions as $key => $value) {
             if($error == true || $sendBuffer == false || !isset($response->getIterator()[$value])) {
+                $this->SetValue($key, 0);
+            } elseif($response->getIterator()[$value]->ERROR) {
+                // The WCM-COM has no value for this parameter (e.g. not installed)
+                $this->SendDebug("RetrieveWCMStatus", "WCM-COM returned an error for ".$key, 0);
                 $this->SetValue($key, 0);
             } else {
                 $this->SetValue($key, $response->getIterator()[$value]->DATA);

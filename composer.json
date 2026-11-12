@@ -1,0 +1,17 @@
+{
+    "name": "efg-osthofen/ips-wcm-com",
+    "description": "IP-Symcon module for Weishaupt WCM-COM",
+    "type": "project",
+    "license": "MIT",
+    "require-dev": {
+        "phpunit/phpunit": "^13.4"
+    },
+    "config": {
+        "sort-packages": true,
+        "process-timeout": 600
+    },
+    "scripts": {
+        "test": "@php -d short_open_tag=1 vendor/bin/phpunit",
+        "test:stable": "@php -d short_open_tag=1 vendor/bin/phpunit --exclude-group known-issue"
+    }
+}

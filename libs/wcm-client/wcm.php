@@ -31,9 +31,12 @@ class FinalTelegramObject {
     public int $PROT;
     public int $INFONR;
     public int $INDEX;
-    public float $DATA;
+    /** Decoded value, null if the WCM answered with an error telegram */
+    public ?float $DATA = null;
     public int $HIGH_BYTE;
     public string $UNIT;
+    /** True if the WCM answered this telegram with COMMAND ERROR (255) */
+    public bool $ERROR = false;
 }
 
 class TelegramObjectCollection implements IteratorAggregate {
@@ -404,14 +407,7 @@ class Weishaupt {
                         throw new Exception("WCM-COM server is busy.");
                     } else {
                         $resTelegramCol = $this->_decodeTelegram($res["header"]);
-                        
-                        // Check that infoNr of requests match with infoNr of response
-                        foreach($resTelegramCol->getIterator() as $pos => $telegram) {
-                            if($telegram->INFONR != $chunk[$pos][3] || !isset($telegram->DATA)) {
-                                throw new Exception("WCM response doesn't match the requests!");
-                            }
-                        }
-                        
+                        $this->_verifyResponse($chunk, $resTelegramCol);
                         $finalRes->addCollection($resTelegramCol);
                     }
                 } catch(Exception $e) {
@@ -432,6 +428,25 @@ class Weishaupt {
     }
     
     /**
+     * Checks that the WCM answered every request telegram of a chunk, in order.
+     * Results are mapped to buffer positions, so a missing telegram would shift
+     * all following values onto the wrong parameters.
+     */
+    private function _verifyResponse(array $requests, FinalTelegramObjectCollection $responses): void {
+        $responses = $responses->getIterator()->getArrayCopy();
+
+        if(count($responses) !== count($requests)) {
+            throw new Exception("WCM response contains ".count($responses)." telegrams, expected ".count($requests).".");
+        }
+
+        foreach($responses as $pos => $telegram) {
+            if($telegram->INFONR != $requests[$pos][3]) {
+                throw new Exception("WCM response doesn't match the requests!");
+            }
+        }
+    }
+
+    /**
      * Clears the telegram buffer
      */
     public function clearBuffer() {
@@ -445,13 +460,20 @@ class Weishaupt {
     private function _decodeTelegram(string $body): FinalTelegramObjectCollection {
         $response = new TelegramObjectCollection();
 
-        $decoded = json_decode($body, $associative = false, $flags = JSON_THROW_ON_ERROR);
-        
-        if(!isset($decoded) || !isset($decoded->telegramm) || empty($decoded->telegramm)) {
+        $decoded = json_decode($body, false, 512, JSON_THROW_ON_ERROR);
+
+        if(!isset($decoded->telegramm) || !is_array($decoded->telegramm) || empty($decoded->telegramm)) {
             throw new Exception("Invalid WCM response. Response is empty.");
         }
-        
+
         foreach($decoded->telegramm as $telegramEntry) {
+            // Every telegram must consist of exactly one integer per field in Type
+            if(!is_array($telegramEntry)
+                || count($telegramEntry) !== count(Type)
+                || count(array_filter($telegramEntry, 'is_int')) !== count(Type)) {
+                throw new Exception("Invalid telegram in WCM response: ".json_encode($telegramEntry));
+            }
+
             $respObj = new TelegramObject();
             foreach($telegramEntry as $i => $value) {
                 $attributeName = array_search($i, Type);
@@ -473,8 +495,13 @@ class Weishaupt {
         foreach ($telegramObjects as $telegramObject) {
             $finalTelegramObj = new FinalTelegramObject();
             $finalTelegramObj->COMMAND = $telegramObject->COMMAND;
-            $finalTelegramObj->MODULTYP = $telegramObject->COMMAND;
-            $finalTelegramObj->DATA = $this->_convertData($telegramObject);
+            $finalTelegramObj->MODULTYP = $telegramObject->MODULTYP;
+            if($telegramObject->COMMAND == Command["ERROR"]) {
+                // The WCM rejected this telegram, DATA carries no value
+                $finalTelegramObj->ERROR = true;
+            } else {
+                $finalTelegramObj->DATA = $this->_convertData($telegramObject);
+            }
             $finalTelegramObj->BUSKENNUNG = $telegramObject->BUSKENNUNG;
             $finalTelegramObj->PROT = $telegramObject->PROT;
             $finalTelegramObj->INDEX = $telegramObject->INDEX;

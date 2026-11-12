@@ -13,6 +13,7 @@ Ausgewählte Parameter (Betriebsart, Raumtemperaturen, Heizkurve, maximale Kesse
 - [Schreibbare Parameter](#schreibbare-parameter)
 - [PHP-Befehlsreferenz](#php-befehlsreferenz)
 - [Funktionsweise](#funktionsweise)
+- [Tests](#tests)
 - [Projektstruktur](#projektstruktur)
 - [Lizenz](#lizenz)
 
@@ -160,6 +161,36 @@ Scheitert das Lesen endgültig, wird der Fehler im IP-Symcon-Log protokolliert u
 Rohwerte werden aus Low- und High-Byte als vorzeichenbehaftete 16-Bit-Zahl zusammengesetzt und je nach Parameter durch 10 oder 100 geteilt.
 Eine Semaphore (`WCM_Communication`) soll verhindern, dass gleichzeitige Schreibzugriffe das WCM-COM überlasten.
 
+## Tests
+
+Die Tests laufen lokal mit PHPUnit und brauchen weder IP-Symcon noch eine echte Heizung.
+
+```bash
+composer install
+composer test
+```
+
+`composer test` startet PHP mit `short_open_tag=1`, weil `module.php` mit `<?` beginnt.
+Ein direkter Aufruf von `vendor/bin/phpunit` bricht deshalb mit einem Hinweis ab.
+
+| Testsuite | Inhalt |
+|---|---|
+| `unit` | Aufbau der Lese- und Schreibtelegramme, Wertebereiche, Low-/High-Byte, Dekodierung und Skalierung je Info-Nummer |
+| `integration` | `sendBuffer()` über echtes HTTP gegen einen simulierten WCM-COM mit Digest-Authentifizierung: Aufteilung in Pakete, Fehler, Wiederholungen |
+| `module` | `WCMConnector` in einer nachgebildeten IP-Symcon-Umgebung: Variablen, Profile, Timer, Lesen, Schreiben, Semaphore |
+
+Der simulierte WCM-COM ([`tests/Support/fake-wcm-router.php`](tests/Support/fake-wcm-router.php)) läuft als PHP-Webserver.
+Er beantwortet Lesetelegramme aus einem kleinen Gerätespeicher, übernimmt Schreibtelegramme und kann gezielt fehlerhafte Antworten liefern.
+
+Tests mit der Gruppe `known-issue` beschreiben das erwartete Verhalten bei bekannten Problemen und schlagen fehl, bis diese behoben sind.
+Ohne diese Tests:
+
+```bash
+composer test:stable
+```
+
+Die Gruppe `slow` enthält Tests, die wegen der eingebauten Wartezeiten bei Wiederholungen einige Sekunden dauern.
+
 ## Projektstruktur
 
 ```
@@ -169,9 +200,14 @@ Eine Semaphore (`WCM_Communication`) soll verhindern, dass gleichzeitige Schreib
 │   ├── module.json           # Moduldefinition (Typ, Präfix, Aliase)
 │   ├── form.json             # Konfigurationsformular der Instanz
 │   └── module.php            # Modul-Logik: Variablen, Timer, RequestAction
-└── libs/wcm-client/
-    ├── wcm.php               # PHP-Client für die WCM-COM-Schnittstelle
-    └── constants.php         # Info-Nummern, Einheiten und Betriebsarten
+├── libs/wcm-client/
+│   ├── wcm.php               # PHP-Client für die WCM-COM-Schnittstelle
+│   └── constants.php         # Info-Nummern, Einheiten und Betriebsarten
+└── tests/
+    ├── Unit/                 # Telegramme kodieren und dekodieren
+    ├── Integration/          # HTTP-Kommunikation mit simuliertem WCM-COM
+    ├── Module/               # WCMConnector in nachgebildetem IP-Symcon
+    └── Support/              # IP-Symcon-Stubs, simulierter WCM-COM
 ```
 
 ## Lizenz
