@@ -11,7 +11,7 @@
         "process-timeout": 600
     },
     "scripts": {
-        "test": "@php -d short_open_tag=1 vendor/bin/phpunit",
-        "test:stable": "@php -d short_open_tag=1 vendor/bin/phpunit --exclude-group known-issue"
+        "test": "phpunit",
+        "test:stable": "phpunit --exclude-group known-issue"
     }
 }

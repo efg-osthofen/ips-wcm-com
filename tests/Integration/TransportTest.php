@@ -99,6 +99,23 @@ final class TransportTest extends TestCase
         $this->assertSame([12.5], self::values($api->sendBuffer()));
     }
 
+    public function testFullBufferOfThirtyTelegramsIsParsed(): void
+    {
+        $device = [];
+        $api = self::api();
+        for ($heizkreis = 1; $heizkreis <= 30; $heizkreis++) {
+            $device['6/' . ($heizkreis - 1) . '/2580'] = -300 + $heizkreis;
+            $api->bufferedRequestRaumfrosttemperaturHK($heizkreis);
+        }
+        FakeWcm::reset(['device' => $device, 'responses' => array_fill(0, 4, ['pretty' => true])]);
+
+        $this->assertEqualsWithDelta(
+            array_map(fn ($hk) => (-300 + $hk) / 10, range(1, 30)),
+            self::values($api->sendBuffer(1)),
+            1e-9
+        );
+    }
+
     public function testWrongPasswordFails(): void
     {
         $api = self::api('wrong');
@@ -222,13 +239,10 @@ final class TransportTest extends TestCase
     }
 
     /**
-     * The answer is parsed from $res["header"], which is the first
-     * CURLINFO_HEADER_SIZE bytes of the *body* (CURLOPT_HEADER is not set).
-     * Because curl's digest handshake receives two header blocks, this works
-     * as long as the answer is shorter than both header blocks together. A
-     * longer answer (here: pretty-printed) is cut off and fails to parse.
+     * Regression: the answer used to be cut off after CURLINFO_HEADER_SIZE
+     * bytes. That only worked while the answer was shorter than the headers
+     * of curl's digest handshake. A pretty-printed answer is much longer.
      */
-    #[Group('known-issue')]
     public function testLongAnswerIsParsedCompletely(): void
     {
         $device = [];

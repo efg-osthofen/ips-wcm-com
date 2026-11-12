@@ -84,7 +84,7 @@ class Weishaupt {
     /**
      * Adds a new telegram to the buffer and returns the buffer position
      */
-    public function bufferedRequestRuecklauftemperatur(): float {
+    public function bufferedRequestRuecklauftemperatur(): int {
         $telegram = [10, 0, Operation["Lesen"], Info["Ruecklauftemperatur"], 0, 0, 0, 0];
 
         return $this->addBuffer($telegram);
@@ -93,7 +93,7 @@ class Weishaupt {
     /**
      * Adds a new telegram to the buffer and returns the buffer position
      */
-    public function bufferedRequestWarmwassertemperatur(): float {
+    public function bufferedRequestWarmwassertemperatur(): int {
         $telegram = [10, 0, Operation["Lesen"], Info["Warmwassertemperatur"], 0, 0, 0, 0];
 
         return $this->addBuffer($telegram);
@@ -287,6 +287,10 @@ class Weishaupt {
     * Adds a new telegram to the buffer and returns the buffer position
     */
     public function bufferedUpdateBetriebsartHK(int $heizkreis, int $betriebsart): int {
+        if(!in_array($betriebsart, BetriebsartHK, true)) {
+            throw new Exception("Invalid Betriebsart ".$betriebsart.", valid values are ".implode(", ", BetriebsartHK));
+        }
+        
         $telegram = [6, ($heizkreis - 1), Operation["Schreiben"], Info["BetriebsartHK"], 0, 0, $betriebsart, 0];
 
         return $this->addBuffer($telegram);
@@ -300,7 +304,7 @@ class Weishaupt {
             throw new Exception("Value outside of valid range of 36% - 100%");
         }
         
-        $telegram = [10, 0, Operation["Schreiben"], Info["MaxLeistungHeizung"], 0, 0, $this->_calcLowByte($maxLeistung * 10), $this->_calcHighByte($maxLeistung * 10)];
+        $telegram = [10, 0, Operation["Schreiben"], Info["MaxLeistungHeizung"], 0, 0, ...$this->_encodeTenths($maxLeistung)];
 
         return $this->addBuffer($telegram);
     }
@@ -313,7 +317,7 @@ class Weishaupt {
             throw new Exception("Value outside of valid range of 36% - 100%");
         }
         
-        $telegram = [10, 0, Operation["Schreiben"], Info["MaxLeistungWW"], 0, 0, $this->_calcLowByte($maxLeistung * 10), $this->_calcHighByte($maxLeistung * 10)];
+        $telegram = [10, 0, Operation["Schreiben"], Info["MaxLeistungWW"], 0, 0, ...$this->_encodeTenths($maxLeistung)];
 
         return $this->addBuffer($telegram);
     }
@@ -326,7 +330,7 @@ class Weishaupt {
             throw new Exception("Value outside of valid range of 0 - 30");
         }
         
-        $telegram = [6, ($heizkreis - 1), Operation["Schreiben"], Info["NormalRaumtemperaturHK"], 0, 0, $this->_calcLowByte($normalRaumtemperatur * 10), $this->_calcHighByte($normalRaumtemperatur * 10)];
+        $telegram = [6, ($heizkreis - 1), Operation["Schreiben"], Info["NormalRaumtemperaturHK"], 0, 0, ...$this->_encodeTenths($normalRaumtemperatur)];
 
         return $this->addBuffer($telegram);
     }
@@ -339,7 +343,7 @@ class Weishaupt {
             throw new Exception("Value outside of valid range of 2.5 - 40");
         }
         
-        $telegram = [6, ($heizkreis - 1), Operation["Schreiben"], Info["SteilheitHK"], 0, 0, $this->_calcLowByte($steilheit * 10), $this->_calcHighByte($steilheit * 10)];
+        $telegram = [6, ($heizkreis - 1), Operation["Schreiben"], Info["SteilheitHK"], 0, 0, ...$this->_encodeTenths($steilheit)];
 
         return $this->addBuffer($telegram);
     }
@@ -352,7 +356,7 @@ class Weishaupt {
             throw new Exception("Value outside of valid range of -10 - 30");
         }
         
-        $telegram = [6, ($heizkreis - 1), Operation["Schreiben"], Info["RaumfrosttemperaturHK"], 0, 0, $this->_calcLowByte($raumfrosttemperatur * 10), $this->_calcHighByte($raumfrosttemperatur * 10)];
+        $telegram = [6, ($heizkreis - 1), Operation["Schreiben"], Info["RaumfrosttemperaturHK"], 0, 0, ...$this->_encodeTenths($raumfrosttemperatur)];
 
         return $this->addBuffer($telegram);
     }
@@ -365,7 +369,7 @@ class Weishaupt {
             throw new Exception("Value outside of valid range of -10 - 30");
         }
         
-        $telegram = [6, ($heizkreis - 1), Operation["Schreiben"], Info["SoWiUmschalttemperaturHK"], 0, 0, $this->_calcLowByte($temperatur * 10), $this->_calcHighByte($temperatur * 10)];
+        $telegram = [6, ($heizkreis - 1), Operation["Schreiben"], Info["SoWiUmschalttemperaturHK"], 0, 0, ...$this->_encodeTenths($temperatur)];
 
         return $this->addBuffer($telegram);
     }
@@ -399,14 +403,14 @@ class Weishaupt {
                         if(!empty($res["curl_error"]))
                             throw new Exception("CURL error occurred: ".$res["curl_error"]);
                         else
-                            throw new Exception("HTTP return code ".$res["http_code"]."\n".$res["header"].$res["body"]);
+                            throw new Exception("HTTP return code ".$res["http_code"]."\n".$res["body"]);
                     }
 
                     // If WCM-COM server is busy and doesn't return a response
-                    if(stripos($res["header"], "server is busy") !== false) {
+                    if(stripos($res["body"], "server is busy") !== false) {
                         throw new Exception("WCM-COM server is busy.");
                     } else {
-                        $resTelegramCol = $this->_decodeTelegram($res["header"]);
+                        $resTelegramCol = $this->_decodeTelegram($res["body"]);
                         $this->_verifyResponse($chunk, $resTelegramCol);
                         $finalRes->addCollection($resTelegramCol);
                     }
@@ -586,6 +590,16 @@ class Weishaupt {
     }
     
     /**
+     * Encodes a value with one decimal as [low byte, high byte] of value * 10.
+     * Rounds to one decimal, e.g. 21.26 -> 213 (casting would cut off to 212).
+     */
+    private function _encodeTenths(float $value): array {
+        $raw = (int) round($value * 10);
+        
+        return [$this->_calcLowByte($raw), $this->_calcHighByte($raw)];
+    }
+    
+    /**
      * Calculate the low byte of a value
      *
      * @param value
@@ -634,8 +648,7 @@ class Weishaupt {
         $res = curl_exec($curl);
         $error = curl_error($curl);
         
-        $result = array( 'header' => '',
-                         'body' => '',
+        $result = array( 'body' => '',
                          'curl_error' => '',
                          'http_code' => '',
                          'last_url' => '');
@@ -643,14 +656,12 @@ class Weishaupt {
             $result['curl_error'] = $error;
             return $result;
         }
-        
-        $header_size = curl_getinfo($curl, CURLINFO_HEADER_SIZE);
-        $result['header'] = substr($res, 0, $header_size);
-        $result['body'] = substr($res, $header_size);
+
+        // CURLOPT_HEADER is not set, so $res contains the complete body and no headers.
+        // (It must not be split at CURLINFO_HEADER_SIZE: that would cut off long answers.)
+        $result['body'] = $res;
         $result['http_code'] = curl_getinfo($curl, CURLINFO_HTTP_CODE);
         $result['last_url'] = curl_getinfo($curl, CURLINFO_EFFECTIVE_URL);
-
-        curl_close($curl);
 
         return $result;
     }

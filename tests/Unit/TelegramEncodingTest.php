@@ -109,12 +109,11 @@ final class TelegramEncodingTest extends TestCase
         $this->assertSame(0, $this->api->bufferedRequestAussentemperatur());
     }
 
-    /** Return type of these two methods is declared as float instead of int. */
-    #[Group('known-issue')]
-    public function testAllRequestMethodsReturnIntegerPositions(): void
+    #[DataProvider('readTelegrams')]
+    public function testRequestMethodReturnsIntegerPosition(string $method, array $args, array $telegram): void
     {
-        $this->assertIsInt($this->api->bufferedRequestRuecklauftemperatur());
-        $this->assertIsInt($this->api->bufferedRequestWarmwassertemperatur());
+        $this->assertIsInt($this->api->$method(...$args));
+        $this->assertIsInt($this->api->$method(...$args), "$method: second position");
     }
 
     public static function writeTelegrams(): iterable
@@ -189,21 +188,46 @@ final class TelegramEncodingTest extends TestCase
         }
     }
 
-    /** Values with more than one decimal are cut off instead of rounded (and trigger a PHP deprecation). */
-    #[Group('known-issue')]
-    public function testValuesWithMoreDecimalsAreRounded(): void
+    public static function valuesWithMoreDecimals(): iterable
     {
-        $this->api->bufferedUpdateNormalRaumtemperaturHK(2, 21.26);
-
-        $this->assertSame(213, self::bufferOf($this->api)[0][6]);
+        yield '21.26 rounds up' => [21.26, 213];
+        yield '21.24 rounds down' => [21.24, 212];
+        yield '-2.26 rounds away from zero' => [-2.26, -23];
+        yield '-2.24 rounds towards zero' => [-2.24, -22];
     }
 
-    /** Any integer is accepted as Betriebsart, even values the WCM does not know. */
-    #[Group('known-issue')]
+    /** Casting to int would cut off (21.26 -> 212) and trigger a PHP deprecation. */
+    #[DataProvider('valuesWithMoreDecimals')]
+    public function testValuesWithMoreDecimalsAreRounded(float $value, int $expectedRaw): void
+    {
+        $this->api->bufferedUpdateRaumfrosttemperaturHK(2, $value);
+        [$telegram] = self::bufferOf($this->api);
+
+        $raw = $telegram[6] | ($telegram[7] << 8);
+        $this->assertSame($expectedRaw, $raw >= 0x8000 ? $raw - 0x10000 : $raw);
+    }
+
+    public function testBetriebsartAcceptsAllKnownValues(): void
+    {
+        foreach ([1, 3, 4, 5, 11, 12, 13, 255] as $betriebsart) {
+            $this->api->bufferedUpdateBetriebsartHK(2, $betriebsart);
+        }
+
+        $this->assertSame([1, 3, 4, 5, 11, 12, 13, 255], array_column(self::bufferOf($this->api), 6));
+    }
+
     public function testBetriebsartRejectsUnknownValues(): void
     {
-        $this->expectException(\Exception::class);
-        $this->api->bufferedUpdateBetriebsartHK(2, 2);
+        foreach ([0, 2, 6, 10, 14, 254, 256, -1] as $betriebsart) {
+            try {
+                $this->api->bufferedUpdateBetriebsartHK(2, $betriebsart);
+                $this->fail("Betriebsart $betriebsart must be rejected");
+            } catch (\Exception $e) {
+                $this->assertStringStartsWith("Invalid Betriebsart $betriebsart,", $e->getMessage());
+            }
+        }
+
+        $this->assertSame([], self::bufferOf($this->api), 'Nothing must be buffered');
     }
 
     public static function lowHighBytes(): iterable

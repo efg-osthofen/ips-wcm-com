@@ -1,8 +1,11 @@
-<?
+<?php
 require __DIR__ . '/../libs/wcm-client/wcm.php';
 
 class WCMConnector extends IPSModule {
     private const BETRIEBSART_HK_PREFIX = "BetriebsartHeizkreis";
+    private const SEMAPHORE = "WCM_Communication";
+    private const SEMAPHORE_TIMEOUT = 10000;
+    private const BLOCKED_MESSAGE = "Durch parallele Anfrage blockiert.";
 
     public function Create() {
         parent::Create();
@@ -72,26 +75,26 @@ class WCMConnector extends IPSModule {
     }
     
     public function RequestAction($Ident, $Value) {
-        if(IPS_SemaphoreEnter("WCM_Communication", 10000)) {
+        if(IPS_SemaphoreEnter(self::SEMAPHORE, self::SEMAPHORE_TIMEOUT)) {
             try {
                 switch($Ident) {
                     case "ParameterUpdate":
                         SetValue($this->GetIDForIdent($Ident), $Value);
-                    
+
                         if($Value === True) {
-                            $this->RetrieveWCMStatus(true);
+                            $this->ReadStatus(true);
                             $this->SetTimerInterval("Update", $this->ReadPropertyInteger("UpdateInterval") * 1000);
                         } else {
                             $this->SetTimerInterval("Update", 0);
-                            $this->RetrieveWCMStatus(false);
+                            $this->ReadStatus(false);
                         }
                         break;
                     case "KesselMaxLeistungHeizung":
-                        $this->UpdateWCMMaxLeistungHeizung($Value);
+                        $this->WriteMaxLeistungHeizung($Value);
                         SetValue($this->GetIDForIdent($Ident), $Value);
                         break;
                     case "KesselMaxLeistungWW":
-                        $this->UpdateWCMMaxLeistungWW($Value);
+                        $this->WriteMaxLeistungWW($Value);
                         SetValue($this->GetIDForIdent($Ident), $Value);
                         break;
                     default:
@@ -118,22 +121,66 @@ class WCMConnector extends IPSModule {
                 }
             } finally {
                 // Always release the semaphore, also on early break or exception
-                IPS_SemaphoreLeave("WCM_Communication");
+                IPS_SemaphoreLeave(self::SEMAPHORE);
             }
         } else {
-            echo "Durch parallele Anfrage blockiert.";
+            echo self::BLOCKED_MESSAGE;
         }
-        
+
     }
 
+    // Public functions (WCM_*) can be called from scripts and the timer at any
+    // time, so each of them takes the semaphore. RequestAction already holds it
+    // and therefore calls the private implementations directly.
+
     public function UpdateWCMMaxLeistungHeizung(int $maxLeistung) {
+        if(!IPS_SemaphoreEnter(self::SEMAPHORE, self::SEMAPHORE_TIMEOUT)) {
+            echo self::BLOCKED_MESSAGE;
+            return;
+        }
+
+        try {
+            $this->WriteMaxLeistungHeizung($maxLeistung);
+        } finally {
+            IPS_SemaphoreLeave(self::SEMAPHORE);
+        }
+    }
+
+    public function UpdateWCMMaxLeistungWW(int $maxLeistung) {
+        if(!IPS_SemaphoreEnter(self::SEMAPHORE, self::SEMAPHORE_TIMEOUT)) {
+            echo self::BLOCKED_MESSAGE;
+            return;
+        }
+
+        try {
+            $this->WriteMaxLeistungWW($maxLeistung);
+        } finally {
+            IPS_SemaphoreLeave(self::SEMAPHORE);
+        }
+    }
+
+    public function RetrieveWCMStatus(bool $sendBuffer = true) {
+        if(!IPS_SemaphoreEnter(self::SEMAPHORE, self::SEMAPHORE_TIMEOUT)) {
+            // Keep the current values and try again with the next timer run
+            $this->SendDebug("RetrieveWCMStatus", "Skipped, WCM-COM is busy with another request", 0);
+            return;
+        }
+
+        try {
+            $this->ReadStatus($sendBuffer);
+        } finally {
+            IPS_SemaphoreLeave(self::SEMAPHORE);
+        }
+    }
+
+    private function WriteMaxLeistungHeizung(int $maxLeistung) {
         $api = new Weishaupt(new WeishauptOptions($this->ReadPropertyString("URL"), $this->ReadPropertyString("Username"), $this->ReadPropertyString("Password")));
 
         $api->bufferedUpdateMaxLeistungHeizung($maxLeistung);
         $this->SendWriteBuffer($api);
     }
 
-    public function UpdateWCMMaxLeistungWW(int $maxLeistung) {
+    private function WriteMaxLeistungWW(int $maxLeistung) {
         $api = new Weishaupt(new WeishauptOptions($this->ReadPropertyString("URL"), $this->ReadPropertyString("Username"), $this->ReadPropertyString("Password")));
 
         $api->bufferedUpdateMaxLeistungWW($maxLeistung);
@@ -154,7 +201,7 @@ class WCMConnector extends IPSModule {
         }
     }
 
-    public function RetrieveWCMStatus(bool $sendBuffer = true) {
+    private function ReadStatus(bool $sendBuffer) {
         $api = new Weishaupt(new WeishauptOptions($this->ReadPropertyString("URL"), $this->ReadPropertyString("Username"), $this->ReadPropertyString("Password")));
 
         $bufferPositions = [];

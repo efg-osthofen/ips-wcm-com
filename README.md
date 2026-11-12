@@ -170,9 +170,6 @@ composer install
 composer test
 ```
 
-`composer test` startet PHP mit `short_open_tag=1`, weil `module.php` mit `<?` beginnt.
-Ein direkter Aufruf von `vendor/bin/phpunit` bricht deshalb mit einem Hinweis ab.
-
 | Testsuite | Inhalt |
 |---|---|
 | `unit` | Aufbau der Lese- und Schreibtelegramme, Wertebereiche, Low-/High-Byte, Dekodierung und Skalierung je Info-Nummer |

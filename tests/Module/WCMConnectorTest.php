@@ -290,18 +290,27 @@ final class WCMConnectorTest extends TestCase
         $this->assertSame('WCM-COM returned an error for SteilheitHK2', \IpsFake::$debug[0]['data']);
     }
 
-    /**
-     * The semaphore only guards RequestAction. The timer (RetrieveWCMStatus)
-     * talks to the WCM even while a write holds the semaphore.
-     */
-    #[Group('known-issue')]
-    public function testCyclicReadRespectsSemaphore(): void
+    /** The timer must not talk to the WCM while a write holds the semaphore. */
+    public function testCyclicReadIsSkippedWhileSemaphoreIsHeld(): void
     {
+        $this->module->RequestAction('ParameterUpdate', true);
+        FakeWcm::reset(['device' => self::DEVICE]);
         IPS_SemaphoreEnter(self::SEMAPHORE, 0);
 
         $this->module->RetrieveWCMStatus(true);
 
         $this->assertSame([], FakeWcm::requests());
+        $this->assertAllValuesAre(fn ($ident, $value) => $value);
+        $this->assertSame('Skipped, WCM-COM is busy with another request', end(\IpsFake::$debug)['data']);
+        $this->assertSame(['WCM_Communication' => true], \IpsFake::$semaphores, 'Foreign semaphore stays held');
+    }
+
+    public function testCyclicReadReleasesSemaphore(): void
+    {
+        $this->module->RetrieveWCMStatus(true);
+
+        $this->assertCount(4, FakeWcm::requests());
+        $this->assertSame([], \IpsFake::$semaphores);
     }
 
     // --- Writing ---------------------------------------------------------
@@ -410,6 +419,58 @@ final class WCMConnectorTest extends TestCase
 
         $this->assertCount(1, FakeWcm::requests(), 'No retry for a rejected write');
         $this->assertSame($before, self::value($ident));
+        $this->assertSame([], \IpsFake::$semaphores);
+    }
+
+    public static function publicMaxLeistungFunctions(): iterable
+    {
+        yield 'Heizung' => ['UpdateWCMMaxLeistungHeizung', [10, 0, 2, 319, 0, 0, 88, 2]];
+        yield 'Warmwasser' => ['UpdateWCMMaxLeistungWW', [10, 0, 2, 345, 0, 0, 88, 2]];
+    }
+
+    #[DataProvider('publicMaxLeistungFunctions')]
+    public function testPublicMaxLeistungFunctionWritesAndReleasesSemaphore(string $method, array $telegram): void
+    {
+        $this->module->$method(60);
+
+        $this->assertSame([$telegram], FakeWcm::sentTelegrams());
+        $this->assertSame([], \IpsFake::$semaphores);
+    }
+
+    #[DataProvider('publicMaxLeistungFunctions')]
+    public function testPublicMaxLeistungFunctionIsBlockedWhileSemaphoreIsHeld(string $method, array $telegram): void
+    {
+        IPS_SemaphoreEnter(self::SEMAPHORE, 0);
+
+        $this->expectOutputString('Durch parallele Anfrage blockiert.');
+        $this->module->$method(60);
+
+        $this->assertSame([], FakeWcm::requests());
+    }
+
+    #[DataProvider('publicMaxLeistungFunctions')]
+    public function testPublicMaxLeistungFunctionReleasesSemaphoreOnError(string $method, array $telegram): void
+    {
+        try {
+            $this->module->$method(20);
+            $this->fail('Expected an exception');
+        } catch (\Exception $e) {
+            $this->assertStringContainsString('outside of valid range', $e->getMessage());
+        }
+
+        $this->assertSame([], \IpsFake::$semaphores);
+    }
+
+    public function testInvalidBetriebsartIsRejected(): void
+    {
+        try {
+            $this->module->RequestAction('BetriebsartHeizkreis2', 2);
+            $this->fail('Expected an exception');
+        } catch (\Exception $e) {
+            $this->assertStringStartsWith('Invalid Betriebsart 2,', $e->getMessage());
+        }
+
+        $this->assertSame([], FakeWcm::requests());
         $this->assertSame([], \IpsFake::$semaphores);
     }
 
