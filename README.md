@@ -55,7 +55,7 @@ Die zyklische Abfrage läuft nur, solange die Variable **Parameter Update** eing
 | `ParameterUpdate` | Parameter Update | Boolean | `~Switch` |
 
 Ist `ParameterUpdate` eingeschaltet, werden die Werte sofort und danach im eingestellten Intervall gelesen.
-Beim Ausschalten wird der Timer gestoppt und alle Werte werden auf `0` gesetzt.
+Beim Ausschalten wird der Timer gestoppt, alle Werte werden auf `0` gesetzt und deaktiviert.
 
 ### Pro Heizkreis *n* (von „erster“ bis „letzter Heizkreis“)
 
@@ -88,6 +88,20 @@ Beim Ausschalten wird der Timer gestoppt und alle Werte werden auf `0` gesetzt.
 | `KesselAbgastemperatur` | Kessel Abgastemperatur | Float | `~Temperature` | |
 | `PufferB10Oben` | Puffer B10 Temperatur Oben | Float | `~Temperature` | |
 | `PufferB11Unten` | Puffer B11 Temperatur Unten | Float | `~Temperature` | |
+
+### Ungültige Werte
+
+Hat das Modul für eine Variable keinen gültigen Wert, setzt es sie auf `0` und deaktiviert sie.
+In der Visualisierung bleibt sie sichtbar, ist aber nicht bedienbar.
+Das passiert, wenn
+
+- die Anlage für den Parameter „N/V“ meldet (z. B. Fühler nicht angeschlossen),
+- das WCM-COM den Parameter mit einem Fehler beantwortet,
+- die Abfrage scheitert (alle Werte) oder
+- **Parameter Update** ausgeschaltet ist (alle Werte).
+
+Sobald wieder ein gültiger Wert gelesen oder erfolgreich geschrieben wird, aktiviert das Modul die Variable wieder.
+Den Deaktiviert-Status der Wert-Variablen verwaltet das Modul selbst, eine manuelle Deaktivierung wird beim nächsten gültigen Wert aufgehoben.
 
 ### Variablenprofile
 
@@ -160,7 +174,7 @@ Scheitert das Lesen endgültig, wird der Fehler im IP-Symcon-Log protokolliert u
 
 Rohwerte werden aus Low- und High-Byte als vorzeichenbehaftete 16-Bit-Zahl zusammengesetzt und je nach Parameter durch 10 oder 100 geteilt.
 Der Rohwert `0x8000` bedeutet „N/V“ (nicht vorhanden, z. B. Fühler nicht angeschlossen).
-Meldet die Anlage für einen Parameter N/V oder einen Fehler, wird nur diese Variable auf `0` gesetzt und im Debug-Fenster der Instanz ein Hinweis ausgegeben.
+Meldet die Anlage für einen Parameter N/V oder einen Fehler, wird nur diese Variable auf `0` gesetzt und deaktiviert (siehe [Ungültige Werte](#ungültige-werte)), im Debug-Fenster der Instanz erscheint ein Hinweis.
 
 Eine Semaphore (`WCM_Communication`) sorgt dafür, dass immer nur eine Anfrage gleichzeitig an das WCM-COM geht.
 Ist sie belegt, wird ein zyklischer Lesevorgang übersprungen und beim nächsten Intervall nachgeholt.

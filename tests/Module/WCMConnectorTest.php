@@ -324,6 +324,124 @@ final class WCMConnectorTest extends TestCase
         $this->assertSame('WCM-COM reports N/V for PufferB10Oben', \IpsFake::$debug[0]['data']);
     }
 
+    // --- Disabled state for invalid values ------------------------------
+
+    private static function disabled(string $ident): bool
+    {
+        return \IpsFake::variable(self::INSTANCE, $ident)['disabled'];
+    }
+
+    /** @return list<string> idents of all disabled variables */
+    private static function disabledIdents(): array
+    {
+        return array_values(array_filter(\IpsFake::idents(self::INSTANCE), fn ($ident) => self::disabled($ident)));
+    }
+
+    public function testAllValuesAreDisabledWhileUpdatesAreOff(): void
+    {
+        $this->assertEqualsCanonicalizing(array_keys(self::EXPECTED), self::disabledIdents());
+        $this->assertFalse(self::disabled('ParameterUpdate'), 'The switch itself stays usable');
+    }
+
+    public function testValidValuesEnableTheVariables(): void
+    {
+        $this->module->RequestAction('ParameterUpdate', true);
+
+        $this->assertSame([], self::disabledIdents());
+    }
+
+    public function testSwitchingUpdatesOffDisablesAllValues(): void
+    {
+        $this->module->RequestAction('ParameterUpdate', true);
+        $this->module->RequestAction('ParameterUpdate', false);
+
+        $this->assertEqualsCanonicalizing(array_keys(self::EXPECTED), self::disabledIdents());
+    }
+
+    #[Group('slow')]
+    public function testFailedReadDisablesAllValues(): void
+    {
+        $this->module->RequestAction('ParameterUpdate', true);
+        FakeWcm::reset(['responses' => array_fill(0, 3, ['status' => 500, 'body' => 'error'])]);
+
+        $this->module->RetrieveWCMStatus(true);
+
+        $this->assertEqualsCanonicalizing(array_keys(self::EXPECTED), self::disabledIdents());
+    }
+
+    public function testNotAvailableValueDisablesOnlyThatVariable(): void
+    {
+        FakeWcm::reset(['device' => ['3/0/118' => -32768] + self::DEVICE]);
+
+        $this->module->RetrieveWCMStatus(true);
+
+        $this->assertSame(['PufferB10Oben'], self::disabledIdents());
+    }
+
+    public function testErrorTelegramDisablesOnlyThatVariable(): void
+    {
+        FakeWcm::reset(['device' => self::DEVICE, 'responses' => [['set' => [8 => [2 => 255]]]]]);
+
+        $this->module->RetrieveWCMStatus(true);
+
+        $this->assertSame(['SteilheitHK2'], self::disabledIdents());
+    }
+
+    public function testVariableIsEnabledAgainWhenValueBecomesValid(): void
+    {
+        FakeWcm::reset(['device' => ['3/0/118' => -32768] + self::DEVICE]);
+        $this->module->RetrieveWCMStatus(true);
+        FakeWcm::reset(['device' => self::DEVICE]);
+
+        $this->module->RetrieveWCMStatus(true);
+
+        $this->assertSame([], self::disabledIdents());
+        $this->assertEqualsWithDelta(55.1, self::value('PufferB10Oben'), 1e-9);
+    }
+
+    public function testSkippedReadKeepsDisabledState(): void
+    {
+        IPS_SemaphoreEnter(self::SEMAPHORE, 0);
+
+        $this->module->RetrieveWCMStatus(true);
+
+        $this->assertEqualsCanonicalizing(array_keys(self::EXPECTED), self::disabledIdents());
+    }
+
+    public function testDisabledStateIsOnlyWrittenWhenItChanges(): void
+    {
+        $this->module->RequestAction('ParameterUpdate', true);
+        \IpsFake::$setDisabledCalls = 0;
+
+        $this->module->RetrieveWCMStatus(true);
+
+        $this->assertSame(0, \IpsFake::$setDisabledCalls);
+    }
+
+    public function testSuccessfulWriteEnablesTheVariable(): void
+    {
+        $this->assertTrue(self::disabled('SteilheitHK2'));
+
+        // A script can still write a disabled variable via RequestAction
+        $this->module->RequestAction('SteilheitHK2', 14.0);
+        $this->module->RequestAction('KesselMaxLeistungWW', 70);
+
+        $this->assertFalse(self::disabled('SteilheitHK2'));
+        $this->assertFalse(self::disabled('KesselMaxLeistungWW'));
+    }
+
+    public function testFailedWriteKeepsDisabledState(): void
+    {
+        FakeWcm::reset(['responses' => [['command' => 255]]]);
+
+        try {
+            $this->module->RequestAction('SteilheitHK2', 14.0);
+        } catch (\Exception) {
+        }
+
+        $this->assertTrue(self::disabled('SteilheitHK2'));
+    }
+
     // --- Writing ---------------------------------------------------------
 
     public static function heizkreisWrites(): iterable

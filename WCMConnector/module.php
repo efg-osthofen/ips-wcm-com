@@ -91,11 +91,11 @@ class WCMConnector extends IPSModule {
                         break;
                     case "KesselMaxLeistungHeizung":
                         $this->WriteMaxLeistungHeizung($Value);
-                        SetValue($this->GetIDForIdent($Ident), $Value);
+                        $this->SetWCMValue($Ident, $Value, true);
                         break;
                     case "KesselMaxLeistungWW":
                         $this->WriteMaxLeistungWW($Value);
-                        SetValue($this->GetIDForIdent($Ident), $Value);
+                        $this->SetWCMValue($Ident, $Value, true);
                         break;
                     default:
                         $api = new Weishaupt(new WeishauptOptions($this->ReadPropertyString("URL"), $this->ReadPropertyString("Username"), $this->ReadPropertyString("Password")));
@@ -117,7 +117,7 @@ class WCMConnector extends IPSModule {
                         $this->SendWriteBuffer($api);
 
                         // Only update the variable once the WCM-COM accepted the new value
-                        SetValue($this->GetIDForIdent($Ident), $Value);
+                        $this->SetWCMValue($Ident, $Value, true);
                 }
             } finally {
                 // Always release the semaphore, also on early break or exception
@@ -201,6 +201,20 @@ class WCMConnector extends IPSModule {
         }
     }
 
+    /**
+     * Sets a WCM value variable. Invalid values (N/V, error, no communication,
+     * updates switched off) are set to 0 and the variable is disabled, so the
+     * visualization shows it as not usable until a valid value arrives.
+     */
+    private function SetWCMValue(string $ident, $value, bool $valid) {
+        $this->SetValue($ident, $valid ? $value : 0);
+
+        $id = $this->GetIDForIdent($ident);
+        if(IPS_GetObject($id)["ObjectIsDisabled"] === $valid) {
+            IPS_SetDisabled($id, !$valid);
+        }
+    }
+
     private function ReadStatus(bool $sendBuffer) {
         $api = new Weishaupt(new WeishauptOptions($this->ReadPropertyString("URL"), $this->ReadPropertyString("Username"), $this->ReadPropertyString("Password")));
 
@@ -246,17 +260,17 @@ class WCMConnector extends IPSModule {
         
         foreach($bufferPositions as $key => $value) {
             if($error == true || $sendBuffer == false || !isset($response->getIterator()[$value])) {
-                $this->SetValue($key, 0);
+                $this->SetWCMValue($key, 0, false);
             } elseif($response->getIterator()[$value]->ERROR) {
                 // The WCM-COM has no value for this parameter (e.g. not installed)
                 $this->SendDebug("RetrieveWCMStatus", "WCM-COM returned an error for ".$key, 0);
-                $this->SetValue($key, 0);
+                $this->SetWCMValue($key, 0, false);
             } elseif($response->getIterator()[$value]->NOT_AVAILABLE) {
                 // Shown as "N/V" on the heating system (e.g. sensor not connected)
                 $this->SendDebug("RetrieveWCMStatus", "WCM-COM reports N/V for ".$key, 0);
-                $this->SetValue($key, 0);
+                $this->SetWCMValue($key, 0, false);
             } else {
-                $this->SetValue($key, $response->getIterator()[$value]->DATA);
+                $this->SetWCMValue($key, $response->getIterator()[$value]->DATA, true);
             }
         }
         

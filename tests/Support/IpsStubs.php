@@ -32,6 +32,9 @@ final class IpsFake
     /** @var list<array{instance:int, message:string, data:string}> */
     public static array $debug = [];
 
+    /** Number of IPS_SetDisabled calls */
+    public static int $setDisabledCalls = 0;
+
     private static int $nextId = 20000;
 
     public static function reset(): void
@@ -43,6 +46,7 @@ final class IpsFake
         self::$semaphores = [];
         self::$log = [];
         self::$debug = [];
+        self::$setDisabledCalls = 0;
         self::$nextId = 20000;
     }
 
@@ -256,6 +260,7 @@ class IPSModule
             'position' => $position,
             'value' => [false, 0, 0.0, ''][$type],
             'action' => false,
+            'disabled' => false,
         ];
 
         return $id;
@@ -304,6 +309,32 @@ function IPS_SemaphoreLeave(string $name): bool
         return false;
     }
     unset(IpsFake::$semaphores[$name]);
+
+    return true;
+}
+
+/** Only the fields WCMConnector uses. */
+function IPS_GetObject(int $objectId): array
+{
+    if (!isset(IpsFake::$variables[$objectId])) {
+        throw new RuntimeException("Object #$objectId does not exist");
+    }
+
+    return [
+        'ObjectID' => $objectId,
+        'ObjectIdent' => IpsFake::$variables[$objectId]['ident'],
+        'ObjectName' => IpsFake::$variables[$objectId]['name'],
+        'ObjectIsDisabled' => IpsFake::$variables[$objectId]['disabled'],
+    ];
+}
+
+function IPS_SetDisabled(int $objectId, bool $disabled): bool
+{
+    if (!isset(IpsFake::$variables[$objectId])) {
+        throw new RuntimeException("Object #$objectId does not exist");
+    }
+    IpsFake::$variables[$objectId]['disabled'] = $disabled;
+    IpsFake::$setDisabledCalls++;
 
     return true;
 }
