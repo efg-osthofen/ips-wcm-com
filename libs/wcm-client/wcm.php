@@ -37,6 +37,8 @@ class FinalTelegramObject {
     public string $UNIT;
     /** True if the WCM answered this telegram with COMMAND ERROR (255) */
     public bool $ERROR = false;
+    /** True if the WCM reports the value as "N/V" (not available, raw 0x8000) */
+    public bool $NOT_AVAILABLE = false;
 }
 
 class TelegramObjectCollection implements IteratorAggregate {
@@ -505,6 +507,7 @@ class Weishaupt {
                 $finalTelegramObj->ERROR = true;
             } else {
                 $finalTelegramObj->DATA = $this->_convertData($telegramObject);
+                $finalTelegramObj->NOT_AVAILABLE = ($finalTelegramObj->DATA === null);
             }
             $finalTelegramObj->BUSKENNUNG = $telegramObject->BUSKENNUNG;
             $finalTelegramObj->PROT = $telegramObject->PROT;
@@ -529,8 +532,9 @@ class Weishaupt {
      * Data is extracted and converted according to its INFONR field
      *
      * @param telegramObject a single telegramObject
+     * @return null if the WCM reports the value as "N/V"
      */
-    private function _convertData(TelegramObject $telegramObject): float {
+    private function _convertData(TelegramObject $telegramObject): ?float {
         switch ($telegramObject->INFONR) {
             case Info["VorlauftemperaturEstb"]:
             case Info["GedaempfteAussentemperatur"]:
@@ -553,11 +557,11 @@ class Weishaupt {
             case Info["RaumfrosttemperaturHK"]:
             case Info["SteilheitHK"]:
                 $val = $this->_extractValue($telegramObject->DATA, $telegramObject->HIGH_BYTE);
-                return ($val / 10);
+                return $val === null ? null : $val / 10;
             case Info["LeistungSolar"]:
             case Info["Durchfluss"]:
                 $val = $this->_extractValue($telegramObject->DATA, $telegramObject->HIGH_BYTE);
-                return ($val / 100);
+                return $val === null ? null : $val / 100;
             case Info["Fehlercode"]:
             case Info["Password"]:
             case Info["StartsiteFooter"]:
@@ -571,22 +575,22 @@ class Weishaupt {
     }
 
     /**
-     * Calculate the Value from the low byte and high byte
+     * Calculate the signed 16-bit value from the low byte and high byte
      *
      * @param lowByte
      * @param highByte
+     * @return null for 0x8000, which the WCM uses for "N/V" (not available)
      */
-    private function _extractValue(int $lowByte, int $highByte): int {
-        $usValue;
+    private function _extractValue(int $lowByte, int $highByte): ?int {
+        if ($highByte === 128 && $lowByte === 0) {
+            return null;
+        }
 
         if ($highByte <= 127) {
-            $usValue = $highByte * 256 + $lowByte;
-        } else if ($highByte === 128 && $lowByte === 0) {
-            $usValue = $highByte * 256 + $lowByte;
-        } else {
-            $usValue = -32768 + ($highByte - 128) * 256 + $lowByte;
+            return $highByte * 256 + $lowByte;
         }
-        return $usValue;
+
+        return -32768 + ($highByte - 128) * 256 + $lowByte;
     }
     
     /**

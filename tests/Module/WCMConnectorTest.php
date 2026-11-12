@@ -313,6 +313,17 @@ final class WCMConnectorTest extends TestCase
         $this->assertSame([], \IpsFake::$semaphores);
     }
 
+    public function testNotAvailableValueResetsOnlyThatVariable(): void
+    {
+        FakeWcm::reset(['device' => ['3/0/118' => -32768] + self::DEVICE]);
+
+        $this->module->RetrieveWCMStatus(true);
+
+        $this->assertAllValuesAre(fn ($ident, $value) => $ident === 'PufferB10Oben' ? 0 : $value);
+        $this->assertSame([], \IpsFake::$log);
+        $this->assertSame('WCM-COM reports N/V for PufferB10Oben', \IpsFake::$debug[0]['data']);
+    }
+
     // --- Writing ---------------------------------------------------------
 
     public static function heizkreisWrites(): iterable

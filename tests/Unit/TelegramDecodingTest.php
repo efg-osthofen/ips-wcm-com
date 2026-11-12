@@ -161,6 +161,48 @@ final class TelegramDecodingTest extends TestCase
         [$result] = $this->decode([self::telegram(10, 12, -35)]);
 
         $this->assertFalse($result->ERROR);
+        $this->assertFalse($result->NOT_AVAILABLE);
+    }
+
+    public static function notAvailableValues(): iterable
+    {
+        // Without detection these were shown as 3276.8 / 327.68
+        yield 'Aussentemperatur (/10)' => [10, 12];
+        yield 'B10PufferOben (/10)' => [3, 118];
+        yield 'VorlauftemperaturHK (/10)' => [12, 15];
+        yield 'SteilheitHK (/10)' => [6, 270];
+        yield 'Durchfluss (/100)' => [10, 130];
+        yield 'LeistungSolar (/100)' => [10, 475];
+    }
+
+    #[DataProvider('notAvailableValues')]
+    public function testRawValue0x8000IsReportedAsNotAvailable(int $modultyp, int $info): void
+    {
+        [$result] = $this->decode([[$modultyp, 0, 1, $info, 0, 0, 0, 128]]);
+
+        $this->assertTrue($result->NOT_AVAILABLE);
+        $this->assertNull($result->DATA);
+        $this->assertFalse($result->ERROR);
+    }
+
+    public function testNeighboursOf0x8000AreRegularValues(): void
+    {
+        $results = $this->decode([
+            [10, 0, 1, 12, 0, 0, 1, 128],     // 0x8001 = -32767
+            [10, 0, 1, 12, 0, 0, 255, 127],   // 0x7FFF = 32767
+        ]);
+
+        $this->assertSame([-3276.7, 3276.7], [$results[0]->DATA, $results[1]->DATA]);
+        $this->assertSame([false, false], [$results[0]->NOT_AVAILABLE, $results[1]->NOT_AVAILABLE]);
+    }
+
+    /** 8-bit values only use the low byte, so the 0x8000 marker does not apply. */
+    public function testEightBitValueIgnoresTheMarker(): void
+    {
+        [$result] = $this->decode([[10, 0, 1, 138, 0, 0, 0, 128]]);
+
+        $this->assertSame(0.0, $result->DATA);
+        $this->assertFalse($result->NOT_AVAILABLE);
     }
 
     public static function malformedTelegrams(): iterable
@@ -192,13 +234,12 @@ final class TelegramDecodingTest extends TestCase
         yield 'minus one' => [255, 255, -1];
         yield 'minus 35' => [221, 255, -35];
         yield 'min + 1' => [1, 128, -32767];
-        // 0x8000 is special-cased and returned as +32768. Whether the WCM uses
-        // it as "no sensor" marker is not documented; it decodes to 3276.8 °C.
-        yield '0x8000' => [0, 128, 32768];
+        // 0x8000 is shown as "N/V" (not available) on the heating system
+        yield '0x8000 is N/V' => [0, 128, null];
     }
 
     #[DataProvider('rawValues')]
-    public function testExtractValueCombinesLowAndHighByte(int $low, int $high, int $expected): void
+    public function testExtractValueCombinesLowAndHighByte(int $low, int $high, ?int $expected): void
     {
         $this->assertSame($expected, self::callPrivate($this->api, '_extractValue', $low, $high));
     }

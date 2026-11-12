@@ -251,6 +251,10 @@ class WCMConnector extends IPSModule {
                 // The WCM-COM has no value for this parameter (e.g. not installed)
                 $this->SendDebug("RetrieveWCMStatus", "WCM-COM returned an error for ".$key, 0);
                 $this->SetValue($key, 0);
+            } elseif($response->getIterator()[$value]->NOT_AVAILABLE) {
+                // Shown as "N/V" on the heating system (e.g. sensor not connected)
+                $this->SendDebug("RetrieveWCMStatus", "WCM-COM reports N/V for ".$key, 0);
+                $this->SetValue($key, 0);
             } else {
                 $this->SetValue($key, $response->getIterator()[$value]->DATA);
             }

@@ -159,7 +159,11 @@ Schlägt ein Paket fehl (HTTP- oder cURL-Fehler, „server is busy“, unpassend
 Scheitert das Lesen endgültig, wird der Fehler im IP-Symcon-Log protokolliert und die Variablen werden auf `0` gesetzt.
 
 Rohwerte werden aus Low- und High-Byte als vorzeichenbehaftete 16-Bit-Zahl zusammengesetzt und je nach Parameter durch 10 oder 100 geteilt.
-Eine Semaphore (`WCM_Communication`) soll verhindern, dass gleichzeitige Schreibzugriffe das WCM-COM überlasten.
+Der Rohwert `0x8000` bedeutet „N/V“ (nicht vorhanden, z. B. Fühler nicht angeschlossen).
+Meldet die Anlage für einen Parameter N/V oder einen Fehler, wird nur diese Variable auf `0` gesetzt und im Debug-Fenster der Instanz ein Hinweis ausgegeben.
+
+Eine Semaphore (`WCM_Communication`) sorgt dafür, dass immer nur eine Anfrage gleichzeitig an das WCM-COM geht.
+Ist sie belegt, wird ein zyklischer Lesevorgang übersprungen und beim nächsten Intervall nachgeholt.
 
 ## Tests
 
