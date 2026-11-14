@@ -10,3 +10,4 @@ require __DIR__ . '/Support/PrivateAccess.php';
 // module.php pulls in libs/wcm-client/wcm.php itself (with require, not
 // require_once), so it must be the only place that loads the client.
 require __DIR__ . '/../WCMConnector/module.php';
+require __DIR__ . '/Support/ClockedWCMConnector.php';

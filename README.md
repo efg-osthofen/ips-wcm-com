@@ -43,6 +43,7 @@ Ausgewählte Parameter (Betriebsart, Raumtemperaturen, Heizkurve, maximale Kesse
 | Update Intervall | Abfrageintervall in Sekunden | `0` |
 | Nummer des ersten Heizkreises | Erster Heizkreis, für den Variablen angelegt werden | `2` |
 | Nummer des letzten Heizkreises | Letzter Heizkreis, für den Variablen angelegt werden | `5` |
+| Lesetakt seltener Parameter | Abstand in Minuten, in dem selten veränderte Parameter gelesen werden (siehe [Last auf dem WCM-COM](#last-auf-dem-wcm-com)). `0` liest sie in jedem Zyklus. | `15` |
 
 Die zyklische Abfrage läuft nur, solange die Variable **Parameter Update** eingeschaltet ist und das Intervall größer als 0 ist.
 
@@ -97,7 +98,7 @@ Das passiert, wenn
 
 - die Anlage für den Parameter „N/V“ meldet (z. B. Fühler nicht angeschlossen),
 - das WCM-COM den Parameter mit einem Fehler beantwortet,
-- die Abfrage scheitert (alle Werte) oder
+- die Abfrage scheitert (alle Werte, auch die in diesem Zyklus nicht gelesenen seltenen Parameter; sie bleiben während der anschließenden Pause deaktiviert) oder
 - **Parameter Update** ausgeschaltet ist (alle Werte).
 
 Sobald wieder ein gültiger Wert gelesen oder erfolgreich geschrieben wird, aktiviert das Modul die Variable wieder.
@@ -141,7 +142,8 @@ Das Modul prüft die Werte vor dem Senden und verwirft Werte außerhalb dieser B
 Das Modul verwendet das Präfix `WCM`.
 
 ```php
-// Alle Werte vom WCM-COM lesen und in die Variablen schreiben.
+// Werte vom WCM-COM lesen und in die Variablen schreiben (seltene Parameter nur,
+// wenn sie fällig sind; während einer Pause nach einem Fehler wird nichts gelesen).
 // Mit $sendBuffer = false werden keine Daten abgefragt, alle Werte werden auf 0 gesetzt.
 WCM_RetrieveWCMStatus(int $InstanzID, bool $sendBuffer);
 
@@ -169,8 +171,40 @@ Ein Telegramm besteht aus acht Bytes:
 
 Die Client-Bibliothek sammelt alle Anfragen in einem Puffer und sendet sie in Paketen von höchstens neun Telegrammen.
 Jede Antwort wird gegen die angefragten Info-Nummern geprüft.
-Schlägt ein Paket fehl (HTTP- oder cURL-Fehler, „server is busy“, unpassende Antwort), wird es nach einer zufälligen Pause von 1–2 Sekunden erneut versucht: beim Lesen bis zu 3-mal, beim Schreiben bis zu 10-mal.
-Scheitert das Lesen endgültig, wird der Fehler im IP-Symcon-Log protokolliert und die Variablen werden auf `0` gesetzt.
+
+### Last auf dem WCM-COM
+
+Das WCM-COM hat wenig Ressourcen und kann sich bei zu vielen Anfragen aufhängen (Port 80 bleibt offen, es antwortet aber nicht mehr, nur ein Stromreset der Heizung hilft).
+Das Modul hält deshalb die Last jeder Abfrage klein:
+
+- **Eine Verbindung pro Zyklus:** Alle Pakete eines Zyklus laufen über dasselbe cURL-Handle.
+  Nur die erste Anfrage braucht die 401-Runde der Digest-Authentifizierung, die folgenden verwenden die Nonce weiter.
+  Unterstützt das WCM-COM Keep-Alive, bleibt auch die TCP-Verbindung bestehen.
+  Bei Heizkreis 2–5 sind das 5 HTTP-Anfragen pro Zyklus (vorher 12).
+- **Seltene Parameter seltener:** Normal-Raumtemperatur, Raumfrosttemperatur, So/Wi-Umschalttemperatur, Steilheit und Max. Leistung Heizung/WW werden nur alle *Lesetakt seltener Parameter* Minuten gelesen.
+  Dazwischen behalten die Variablen ihren Wert und bleiben aktiv.
+  Nach dem Einschalten von **Parameter Update** und nach einem Fehler werden sie sofort gelesen.
+  Ein geschriebener Wert wird im nächsten Zyklus einmal vom Gerät zurückgelesen.
+- **Zeitlimits:** Verbindungsaufbau höchstens 3 s, eine Anfrage höchstens 8 s, ein ganzer Lesezyklus höchstens 8 s.
+  So endet ein Zyklus vor dem Timeout der Semaphore (10 s) und vor dem nächsten Intervall.
+- **Pause statt Wiederholung:** Ein Lesezyklus wird nicht wiederholt.
+  Scheitert er (Zeitüberschreitung, keine Verbindung, HTTP-Fehler, „server is busy“, unpassende Antwort), wird der Fehler im IP-Symcon-Log protokolliert, alle Werte werden auf `0` gesetzt und deaktiviert.
+  Danach pausiert die zyklische Abfrage 1 min, nach weiteren Fehlern 2 min und dann jeweils 5 min.
+  Während der Pause bleiben die Variablen deaktiviert und werden nicht aktualisiert.
+  Der erste erfolgreiche Zyklus beendet die Pause; **Parameter Update** einschalten beendet sie sofort.
+- **Schreiben:** Bei HTTP-Fehlern, „server is busy“ oder unpassender Antwort wird bis zu 10-mal mit 1–2 s Pause wiederholt.
+  Antwortet das WCM-COM gar nicht, wird nicht wiederholt und die zyklische Abfrage pausiert wie nach einem fehlgeschlagenen Lesezyklus.
+  Schreiben ist auch während einer Pause möglich.
+
+Im Debug-Fenster der Instanz steht nach jedem Zyklus eine Zeile mit Telegrammen, Paketen, HTTP-Anfragen (einschließlich 401-Runden), neu aufgebauten Verbindungen und Dauer, z. B.:
+
+```
+Zyklus OK: 28 Telegramme, 4/4 Blöcke, 5 HTTP-Anfragen, 1 Verbindung(en), 1,84 s, seltene Parameter: keine
+Zyklus fehlgeschlagen (Timeout): CURL error occurred: ... | 28 Telegramme, 2/4 Blöcke, 3 HTTP-Anfragen, 1 Verbindung(en), 8,00 s | Pause 60 s (Fehler Nr. 1)
+Pause nach Fehler, nächster Versuch in 45 s
+```
+
+Zeigt die Zeile bei mehreren Blöcken nur 1 Verbindung, hält das WCM-COM die Verbindung offen (Keep-Alive).
 
 Rohwerte werden aus Low- und High-Byte als vorzeichenbehaftete 16-Bit-Zahl zusammengesetzt und je nach Parameter durch 10 oder 100 geteilt.
 Der Rohwert `0x8000` bedeutet „N/V“ (nicht vorhanden, z. B. Fühler nicht angeschlossen).
@@ -191,8 +225,8 @@ composer test
 | Testsuite | Inhalt |
 |---|---|
 | `unit` | Aufbau der Lese- und Schreibtelegramme, Wertebereiche, Low-/High-Byte, Dekodierung und Skalierung je Info-Nummer |
-| `integration` | `sendBuffer()` über echtes HTTP gegen einen simulierten WCM-COM mit Digest-Authentifizierung: Aufteilung in Pakete, Fehler, Wiederholungen |
-| `module` | `WCMConnector` in einer nachgebildeten IP-Symcon-Umgebung: Variablen, Profile, Timer, Lesen, Schreiben, Semaphore |
+| `integration` | `sendBuffer()` über echtes HTTP gegen einen simulierten WCM-COM mit Digest-Authentifizierung: Aufteilung in Pakete, Fehler, Wiederholungen, gemeinsames cURL-Handle und Nonce, Zeitlimits |
+| `module` | `WCMConnector` in einer nachgebildeten IP-Symcon-Umgebung: Variablen, Profile, Timer, Lesen, Schreiben, Semaphore, Lesetakt seltener Parameter, Pause nach Fehlern |
 
 Der simulierte WCM-COM ([`tests/Support/fake-wcm-router.php`](tests/Support/fake-wcm-router.php)) läuft als PHP-Webserver.
 Er beantwortet Lesetelegramme aus einem kleinen Gerätespeicher, übernimmt Schreibtelegramme und kann gezielt fehlerhafte Antworten liefern.

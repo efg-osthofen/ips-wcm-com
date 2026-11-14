@@ -21,7 +21,39 @@ function reply(int $status, string $body, array $headers = []): void
     echo $body;
 }
 
-function digestIsValid(string $header, array $scenario, string $realm): bool
+/** Appends one line to a JSON lines file in the state directory. */
+function logLine(string $file, array $entry): void
+{
+    file_put_contents($file, json_encode($entry) . "\n", FILE_APPEND | LOCK_EX);
+}
+
+/** @return array<string, int> issued nonces => number of requests authenticated with it */
+function loadNonces(string $stateDir): array
+{
+    $nonces = @file_get_contents("$stateDir/nonces.json");
+
+    return $nonces === false ? [] : (json_decode($nonces, true) ?: []);
+}
+
+function saveNonces(string $stateDir, array $nonces): void
+{
+    file_put_contents("$stateDir/nonces.json", json_encode((object) $nonces), LOCK_EX);
+}
+
+/** Answers 401 with a fresh nonce, like the WCM-COM does for every request without valid credentials. */
+function challenge(string $stateDir, string $realm, bool $stale): void
+{
+    $nonce = bin2hex(random_bytes(8));
+    $nonces = loadNonces($stateDir);
+    $nonces[$nonce] = 0;
+    saveNonces($stateDir, $nonces);
+    logLine("$stateDir/auth.jsonl", ['status' => 401, 'stale' => $stale]);
+
+    reply(401, '', ["WWW-Authenticate: Digest realm=\"$realm\", qop=\"auth\", nonce=\"$nonce\", opaque=\"5ccc069c\"" . ($stale ? ', stale=true' : '')]);
+}
+
+/** @return array<string, string> the fields of a digest Authorization header */
+function digestFields(string $header): array
 {
     preg_match_all('/(\w+)=(?:"([^"]*)"|([^\s,]+))/', $header, $matches, PREG_SET_ORDER);
     $p = [];
@@ -29,6 +61,11 @@ function digestIsValid(string $header, array $scenario, string $realm): bool
         $p[$match[1]] = ($match[2] ?? '') !== '' ? $match[2] : ($match[3] ?? '');
     }
 
+    return $p;
+}
+
+function digestIsValid(array $p, array $scenario, string $realm): bool
+{
     foreach (['username', 'nonce', 'uri', 'response', 'nc', 'cnonce', 'qop'] as $required) {
         if (!isset($p[$required])) {
             return false;
@@ -52,12 +89,25 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST' || parse_url($_SERVER['REQUEST_URI'], 
 
 if ($scenario['auth']) {
     $authorization = getallheaders()['Authorization'] ?? '';
-    if (!str_starts_with($authorization, 'Digest ') || !digestIsValid(substr($authorization, 7), $scenario, $realm)) {
-        $nonce = bin2hex(random_bytes(8));
-        reply(401, '', ["WWW-Authenticate: Digest realm=\"$realm\", qop=\"auth\", nonce=\"$nonce\", opaque=\"5ccc069c\""]);
+    $digest = str_starts_with($authorization, 'Digest ') ? digestFields(substr($authorization, 7)) : [];
+    $nonces = loadNonces($stateDir);
+
+    // Only nonces issued by this server are accepted
+    if ($digest === [] || !digestIsValid($digest, $scenario, $realm) || !isset($nonces[$digest['nonce']])) {
+        challenge($stateDir, $realm, false);
 
         return true;
     }
+    // "nonceUses": a nonce expires after this many requests, the client has to fetch a new one
+    if (isset($scenario['nonceUses']) && $nonces[$digest['nonce']] >= $scenario['nonceUses']) {
+        challenge($stateDir, $realm, true);
+
+        return true;
+    }
+
+    $nonces[$digest['nonce']]++;
+    saveNonces($stateDir, $nonces);
+    logLine("$stateDir/auth.jsonl", ['status' => 200, 'nonce' => $digest['nonce'], 'nc' => $digest['nc']]);
 }
 
 $request = json_decode(file_get_contents('php://input'), true);
@@ -65,6 +115,12 @@ $log = "$stateDir/requests.jsonl";
 file_put_contents($log, json_encode($request) . "\n", FILE_APPEND | LOCK_EX);
 $requestIndex = count(file($log, FILE_SKIP_EMPTY_LINES)) - 1;
 $override = $scenario['responses'][$requestIndex] ?? [];
+
+// "delay": slow device, seconds before the answer (per response or for all requests)
+$delay = $override['delay'] ?? $scenario['delay'] ?? 0;
+if ($delay > 0) {
+    usleep((int) ($delay * 1000000));
+}
 
 if (isset($override['status']) || isset($override['body'])) {
     reply($override['status'] ?? 200, $override['body'] ?? '');

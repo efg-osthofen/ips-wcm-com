@@ -11,8 +11,8 @@ use Tests\Support\FakeWcm;
 /**
  * sendBuffer() against a simulated WCM-COM over real HTTP with digest auth.
  *
- * Note: every failed attempt sleeps 1-2 s in sendBuffer(), also before the
- * final exception, so the error tests use a single attempt where possible.
+ * Note: a failed attempt that is followed by another attempt sleeps 1-2 s in
+ * sendBuffer(), so the error tests use a single attempt where possible.
  */
 final class TransportTest extends TestCase
 {
@@ -26,9 +26,20 @@ final class TransportTest extends TestCase
         FakeWcm::reset();
     }
 
-    private static function api(string $password = FakeWcm::PASSWORD, ?string $url = null): \Weishaupt
+    private static function api(string $password = FakeWcm::PASSWORD, ?string $url = null, float $connectTimeout = 3.0, float $requestTimeout = 8.0): \Weishaupt
     {
-        return new \Weishaupt(new \WeishauptOptions($url ?? FakeWcm::url(), FakeWcm::USERNAME, $password));
+        return new \Weishaupt(new \WeishauptOptions($url ?? FakeWcm::url(), FakeWcm::USERNAME, $password, $connectTimeout, $requestTimeout));
+    }
+
+    /** Buffers $count read telegrams (VorlauftemperaturHK of Heizkreis 1..$count). */
+    private static function apiWithTelegrams(int $count, float $requestTimeout = 8.0): \Weishaupt
+    {
+        $api = self::api(requestTimeout: $requestTimeout);
+        for ($heizkreis = 1; $heizkreis <= $count; $heizkreis++) {
+            $api->bufferedRequestVorlauftemperaturHK($heizkreis);
+        }
+
+        return $api;
     }
 
     /** @return list<float> */
@@ -254,5 +265,164 @@ final class TransportTest extends TestCase
         FakeWcm::reset(['device' => $device, 'responses' => [['pretty' => true]]]);
 
         $this->assertCount(9, iterator_to_array($api->sendBuffer(1)->getIterator()));
+    }
+
+    // --- Load: one curl handle, digest nonce reused --------------------------
+
+    /** Before: every chunk had its own handle, i.e. its own 401 round trip and nonce. */
+    public function testAllChunksShareOneDigestChallengeAndNonce(): void
+    {
+        $api = self::apiWithTelegrams(20);
+
+        $api->sendBuffer();
+
+        $this->assertCount(3, FakeWcm::requests());
+        $this->assertSame(1, FakeWcm::challenges(), 'Only the first request needs the 401 round trip');
+        $nonces = FakeWcm::usedNonces();
+        $this->assertCount(3, $nonces);
+        $this->assertCount(1, array_unique($nonces), 'All chunks use the same nonce');
+        $this->assertSame(['00000001', '00000002', '00000003'], array_column(FakeWcm::authLog(), 'nc'), 'Nonce count increases');
+    }
+
+    public function testHandleIsReusedForFurtherSendBufferCalls(): void
+    {
+        $api = self::api();
+        $api->bufferedUpdateSteilheitHK(2, 12.5);
+        $api->sendBuffer();
+        $api->clearBuffer();
+        $api->bufferedRequestSteilheitHK(2);
+
+        $this->assertSame([12.5], self::values($api->sendBuffer()));
+        $this->assertSame(1, FakeWcm::challenges());
+    }
+
+    /** If the WCM-COM lets a nonce expire, curl fetches a new one by itself. */
+    public function testExpiredNonceIsRenewedTransparently(): void
+    {
+        FakeWcm::reset(['nonceUses' => 2]);
+        $api = self::apiWithTelegrams(30);
+
+        $this->assertCount(30, iterator_to_array($api->sendBuffer(1)->getIterator()));
+        $this->assertCount(4, FakeWcm::requests());
+        $this->assertSame(2, FakeWcm::challenges(), 'Initial challenge + one stale nonce');
+        $this->assertSame(6, $api->getLastStats()['http_requests']);
+    }
+
+    public function testStatisticsOfLastSendBuffer(): void
+    {
+        $api = self::apiWithTelegrams(20);
+
+        $api->sendBuffer();
+        $stats = $api->getLastStats();
+
+        $this->assertSame(20, $stats['telegrams']);
+        $this->assertSame(3, $stats['blocks']);
+        $this->assertSame(3, $stats['sent_blocks']);
+        $this->assertSame(4, $stats['http_requests'], '3 POSTs + 1 challenge');
+        $this->assertGreaterThanOrEqual(1, $stats['connections']);
+        $this->assertGreaterThan(0.0, $stats['duration']);
+    }
+
+    public function testStatisticsCountRetriedRequests(): void
+    {
+        FakeWcm::reset(['responses' => [['body' => 'server is busy']]]);
+        $api = self::apiWithTelegrams(1);
+
+        $api->sendBuffer(2);
+
+        $this->assertSame(['telegrams' => 1, 'blocks' => 1, 'sent_blocks' => 1, 'http_requests' => 3], array_intersect_key($api->getLastStats(), array_flip(['telegrams', 'blocks', 'sent_blocks', 'http_requests'])));
+    }
+
+    // --- Timeouts and time budget -----------------------------------------
+
+    public function testRequestTimeoutAbortsSlowAnswerWithoutRetry(): void
+    {
+        FakeWcm::reset(['delay' => 1.0]);
+        $api = self::apiWithTelegrams(1, requestTimeout: 0.3);
+
+        $start = microtime(true);
+        try {
+            $api->sendBuffer(3);
+            $this->fail('Expected a timeout');
+        } catch (\WeishauptTimeoutException $e) {
+            $this->assertStringContainsString('CURL error occurred', $e->getMessage());
+        }
+
+        $this->assertLessThan(0.9, microtime(true) - $start, 'Neither waits for the answer nor retries');
+        $this->assertCount(1, FakeWcm::requests());
+        usleep(800000); // let the fake server finish the delayed answer
+    }
+
+    /** The time budget limits all chunks together, not each request. */
+    public function testTimeBudgetLimitsTheWholeBuffer(): void
+    {
+        FakeWcm::reset(['delay' => 0.4]);
+        $api = self::apiWithTelegrams(30);
+
+        $start = microtime(true);
+        try {
+            $api->sendBuffer(1, 1.0);
+            $this->fail('Expected a timeout');
+        } catch (\WeishauptTimeoutException) {
+        }
+        $duration = microtime(true) - $start;
+
+        $this->assertGreaterThanOrEqual(0.95, $duration);
+        $this->assertLessThan(1.4, $duration);
+        $this->assertSame(2, $api->getLastStats()['sent_blocks']);
+        $this->assertCount(3, FakeWcm::requests(), 'Chunk 4 is not sent any more');
+        usleep(400000);
+    }
+
+    public function testExhaustedTimeBudgetSendsNothingMore(): void
+    {
+        $api = self::apiWithTelegrams(1);
+
+        $this->expectException(\WeishauptTimeoutException::class);
+        $this->expectExceptionMessage('Time budget of 0.0 s for sending the buffer exhausted.');
+        try {
+            $api->sendBuffer(1, 0.0);
+        } finally {
+            $this->assertSame([], FakeWcm::requests());
+        }
+    }
+
+    public function testUnreachableDeviceIsNotRetried(): void
+    {
+        $api = self::api(url: 'http://127.0.0.1:1');
+        $api->bufferedRequestAussentemperatur();
+
+        $start = microtime(true);
+        try {
+            $api->sendBuffer(10);
+            $this->fail('Expected a connection error');
+        } catch (\WeishauptConnectionException $e) {
+            $this->assertStringContainsString('CURL error occurred', $e->getMessage());
+        }
+        $this->assertLessThan(0.5, microtime(true) - $start, 'No pauses for retries');
+    }
+
+    public function testNoPauseAfterTheLastAttempt(): void
+    {
+        FakeWcm::reset(['responses' => [['status' => 500, 'body' => 'error']]]);
+        $api = self::apiWithTelegrams(1);
+
+        $start = microtime(true);
+        try {
+            $api->sendBuffer(1);
+            $this->fail('Expected an HTTP error');
+        } catch (\Exception $e) {
+            $this->assertNotInstanceOf(\WeishauptConnectionException::class, $e);
+        }
+        $this->assertLessThan(0.5, microtime(true) - $start);
+    }
+
+    public function testBusyAnswerHasItsOwnExceptionType(): void
+    {
+        FakeWcm::reset(['responses' => [['body' => 'server is busy']]]);
+        $api = self::apiWithTelegrams(1);
+
+        $this->expectException(\WeishauptBusyException::class);
+        $api->sendBuffer(1);
     }
 }

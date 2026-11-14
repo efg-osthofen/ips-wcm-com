@@ -5,13 +5,28 @@ class WeishauptOptions {
     public string $url;
     public string $username;
     public string $password;
+    /** Seconds to wait for the TCP connection */
+    public float $connectTimeout;
+    /** Seconds one HTTP request may take in total (including the connection) */
+    public float $requestTimeout;
     
-    public function __construct(string $url, string $username, string $password) {
+    public function __construct(string $url, string $username, string $password, float $connectTimeout = 3.0, float $requestTimeout = 8.0) {
         $this->url = $url;
         $this->username = $username;
         $this->password = $password;
+        $this->connectTimeout = $connectTimeout;
+        $this->requestTimeout = $requestTimeout;
     }
 }
+
+/** The WCM-COM did not answer at all (connection failed, timeout). Not retried. */
+class WeishauptConnectionException extends Exception {}
+
+/** The WCM-COM did not answer in time, or the time budget of sendBuffer() ran out. */
+class WeishauptTimeoutException extends WeishauptConnectionException {}
+
+/** The WCM-COM answered "server is busy". */
+class WeishauptBusyException extends Exception {}
 
 class TelegramObject {
     public int $MODULTYP;
@@ -74,13 +89,62 @@ class Weishaupt {
     private string $url;
     private string $username;
     private string $password;
+    private float $connectTimeout;
+    private float $requestTimeout;
     
     private array $telegramRequestBuffer = [];
+
+    /**
+     * One curl handle for all requests of this object. curl keeps the connection
+     * (if the WCM-COM allows keep-alive) and the digest nonce, so only the first
+     * request needs the 401 challenge round trip.
+     * @var CurlHandle|resource|null
+     */
+    private $curl = null;
+
+    /** Statistics of the last sendBuffer() call, see getLastStats() */
+    private array $lastStats = [];
+
+    /** HTTP responses seen by the curl handle (own object, so the header callback doesn't reference $this) */
+    private stdClass $responseCounter;
 
     public function __construct(WeishauptOptions $options) {
         $this->url = $options->url;
         $this->username = $options->username;
         $this->password = $options->password;
+        $this->connectTimeout = $options->connectTimeout;
+        $this->requestTimeout = $options->requestTimeout;
+        $this->lastStats = self::emptyStats(0, 0);
+        $this->responseCounter = new stdClass();
+        $this->responseCounter->count = 0;
+    }
+
+    /**
+     * Statistics of the last sendBuffer() call:
+     * telegrams, blocks (planned), sent_blocks (answered successfully),
+     * http_requests (including 401 challenges and retries), connections (new
+     * TCP connections) and duration (seconds).
+     */
+    public function getLastStats(): array {
+        return $this->lastStats;
+    }
+
+    /**
+     * Releases the curl handle (and with it the connection and the digest nonce).
+     */
+    public function close(): void {
+        $this->curl = null;
+    }
+
+    private static function emptyStats(int $telegrams, int $blocks): array {
+        return [
+            'telegrams' => $telegrams,
+            'blocks' => $blocks,
+            'sent_blocks' => 0,
+            'http_requests' => 0,
+            'connections' => 0,
+            'duration' => 0.0,
+        ];
     }
 
     /**
@@ -384,50 +448,91 @@ class Weishaupt {
     
     /**
      * Sends buffered telegrams to WCM-COM (Reads and Updates)
+     *
+     * A chunk that fails with an HTTP error, "server is busy" or an invalid
+     * answer is sent again after a pause of 1-2 s, up to $NUM_OF_ATTEMPTS times
+     * in total. If the WCM-COM does not answer at all (connection error,
+     * timeout), there is no further attempt: it would only add load to a device
+     * that already struggles.
+     *
+     * @param int $NUM_OF_ATTEMPTS attempts per chunk
+     * @param float|null $timeBudget seconds all requests together may take, null for no limit
+     * @throws WeishauptConnectionException if the WCM-COM did not answer (WeishauptTimeoutException: in time)
+     * @throws WeishauptBusyException if the WCM-COM is busy
      */
-    public function sendBuffer($NUM_OF_ATTEMPTS = 3): FinalTelegramObjectCollection {
+    public function sendBuffer($NUM_OF_ATTEMPTS = 3, ?float $timeBudget = null): FinalTelegramObjectCollection {
         $chunks = array_chunk($this->telegramRequestBuffer, 9);
         $finalRes = new FinalTelegramObjectCollection();
-        
-        foreach($chunks as $chunk) {
-            $body = [
-                "prot" => "coco",
-                "telegramm" => $chunk
-            ];
-            
-            $attempts = 0;
-            do {
-                try {
-                    $res = $this->_callAPI("POST", $this->url."/parameter.json", $body);
 
-                    // Throw exception if http or curl error occurred
-                    if ($res["http_code"] != 200) {
-                        if(!empty($res["curl_error"]))
-                            throw new Exception("CURL error occurred: ".$res["curl_error"]);
-                        else
-                            throw new Exception("HTTP return code ".$res["http_code"]."\n".$res["body"]);
+        $start = microtime(true);
+        $deadline = $timeBudget === null ? null : $start + $timeBudget;
+        $this->lastStats = self::emptyStats(count($this->telegramRequestBuffer), count($chunks));
+        $responsesBefore = $this->responseCounter->count;
+
+        try {
+            foreach($chunks as $chunk) {
+                $body = [
+                    "prot" => "coco",
+                    "telegramm" => $chunk
+                ];
+
+                $attempts = 0;
+                $lastError = null;
+                do {
+                    $timeout = $this->requestTimeout;
+                    if($deadline !== null) {
+                        $remaining = $deadline - microtime(true);
+                        if($remaining <= 0) {
+                            // Report the actual problem if a retry ran out of time
+                            throw $lastError ?? new WeishauptTimeoutException(sprintf("Time budget of %.1f s for sending the buffer exhausted.", $timeBudget));
+                        }
+                        $timeout = min($timeout, $remaining);
                     }
 
-                    // If WCM-COM server is busy and doesn't return a response
-                    if(stripos($res["body"], "server is busy") !== false) {
-                        throw new Exception("WCM-COM server is busy.");
-                    } else {
-                        $resTelegramCol = $this->_decodeTelegram($res["body"]);
-                        $this->_verifyResponse($chunk, $resTelegramCol);
-                        $finalRes->addCollection($resTelegramCol);
-                    }
-                } catch(Exception $e) {
-                    $attempts++;
-                    usleep(rand(500000, 1000000));
-                    usleep(rand(500000, 1000000));
-                    if($attempts >= $NUM_OF_ATTEMPTS) {
+                    try {
+                        $res = $this->_callAPI("POST", $this->url."/parameter.json", $body, $timeout);
+
+                        // Throw exception if http or curl error occurred
+                        if ($res["http_code"] != 200) {
+                            if(!empty($res["curl_error"])) {
+                                $message = "CURL error occurred: ".$res["curl_error"];
+                                if($res["curl_errno"] == CURLE_OPERATION_TIMEDOUT) {
+                                    throw new WeishauptTimeoutException($message);
+                                }
+                                throw new WeishauptConnectionException($message);
+                            } else {
+                                throw new Exception("HTTP return code ".$res["http_code"]."\n".$res["body"]);
+                            }
+                        }
+
+                        // If WCM-COM server is busy and doesn't return a response
+                        if(stripos($res["body"], "server is busy") !== false) {
+                            throw new WeishauptBusyException("WCM-COM server is busy.");
+                        } else {
+                            $resTelegramCol = $this->_decodeTelegram($res["body"]);
+                            $this->_verifyResponse($chunk, $resTelegramCol);
+                            $finalRes->addCollection($resTelegramCol);
+                            $this->lastStats['sent_blocks']++;
+                        }
+                    } catch(WeishauptConnectionException $e) {
                         throw $e;
+                    } catch(Exception $e) {
+                        $attempts++;
+                        if($attempts >= $NUM_OF_ATTEMPTS) {
+                            throw $e;
+                        }
+                        $lastError = $e;
+                        usleep(rand(500000, 1000000));
+                        usleep(rand(500000, 1000000));
+                        continue;
                     }
-                    continue;
-                }
-                
-                break;
-            } while(true);
+
+                    break;
+                } while(true);
+            }
+        } finally {
+            $this->lastStats['duration'] = microtime(true) - $start;
+            $this->lastStats['http_requests'] = $this->responseCounter->count - $responsesBefore;
         }
         
         return $finalRes;
@@ -621,43 +726,60 @@ class Weishaupt {
         return ($value >> 8) & 0xff;
     }
     
-    // Method: POST, PUT, GET etc
-    // Data: array("param" => "value") ==> index.php?param=value
-    private function _callAPI($method, $url, $data = false) {
-        $curl = curl_init();
+    /**
+     * Sends one request on the shared curl handle.
+     *
+     * @param string $method POST, everything else is sent as GET
+     * @param mixed $data POST: sent as JSON body, GET: appended as query string
+     * @param float $timeout seconds this request may take in total
+     */
+    private function _callAPI(string $method, string $url, $data, float $timeout): array {
+        if($this->curl === null) {
+            $this->curl = curl_init();
+            curl_setopt($this->curl, CURLOPT_HTTPAUTH, CURLAUTH_DIGEST);
+            curl_setopt($this->curl, CURLOPT_USERPWD, $this->username.":".$this->password);
+            curl_setopt($this->curl, CURLOPT_RETURNTRANSFER, 1);
+            // Timeouts below one second need curl to work without signals
+            curl_setopt($this->curl, CURLOPT_NOSIGNAL, 1);
+            // No "Expect: 100-continue" round trip for larger bodies
+            curl_setopt($this->curl, CURLOPT_HTTPHEADER, ["Expect:"]);
+            // Count every HTTP response, including the 401 digest challenges
+            $counter = $this->responseCounter;
+            curl_setopt($this->curl, CURLOPT_HEADERFUNCTION, static function($curl, string $header) use ($counter): int {
+                if(preg_match('#^HTTP/\S+\s+[2-9]\d\d#', $header)) {
+                    $counter->count++;
+                }
+                return strlen($header);
+            });
+        }
+        $curl = $this->curl;
 
-        switch ($method)
-        {
-            case "POST":
-                curl_setopt($curl, CURLOPT_POST, 1);
-
-                if ($data)
-                    curl_setopt($curl, CURLOPT_POSTFIELDS, json_encode($data));
-                break;
-            case "PUT":
-                curl_setopt($curl, CURLOPT_PUT, 1);
-                break;
-            default:
-                if ($data)
-                    $url = sprintf("%s?%s", $url, http_build_query($data));
+        if($method === "POST") {
+            curl_setopt($curl, CURLOPT_POST, 1);
+            curl_setopt($curl, CURLOPT_POSTFIELDS, $data ? json_encode($data) : "");
+        } else {
+            curl_setopt($curl, CURLOPT_HTTPGET, 1);
+            if ($data)
+                $url = sprintf("%s?%s", $url, http_build_query($data));
         }
 
-        // Optional Authentication:
-        curl_setopt($curl, CURLOPT_HTTPAUTH, CURLAUTH_DIGEST);
-        curl_setopt($curl, CURLOPT_USERPWD, $this->username.":".$this->password);
-
+        $timeoutMs = max(1, (int) round($timeout * 1000));
+        curl_setopt($curl, CURLOPT_TIMEOUT_MS, $timeoutMs);
+        curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, min($timeoutMs, max(1, (int) round($this->connectTimeout * 1000))));
         curl_setopt($curl, CURLOPT_URL, $url);
-        curl_setopt($curl, CURLOPT_RETURNTRANSFER, 1);
 
         $res = curl_exec($curl);
         $error = curl_error($curl);
+        $this->lastStats['connections'] += (int) curl_getinfo($curl, CURLINFO_NUM_CONNECTS);
         
         $result = array( 'body' => '',
                          'curl_error' => '',
+                         'curl_errno' => 0,
                          'http_code' => '',
                          'last_url' => '');
         if ($error != "") {
             $result['curl_error'] = $error;
+            $result['curl_errno'] = curl_errno($curl);
             return $result;
         }
 

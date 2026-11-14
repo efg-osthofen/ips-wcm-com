@@ -19,7 +19,7 @@ final class WCMConnectorTest extends TestCase
     private const SEMAPHORE = 'WCM_Communication';
 
     /** Raw device values, keyed MODULTYP/BUSKENNUNG/INFONR. */
-    private const DEVICE = [
+    public const DEVICE = [
         '0/0/1' => 0,
         '10/0/12' => -35,
         '10/0/2572' => -12,
@@ -55,7 +55,7 @@ final class WCMConnectorTest extends TestCase
     ];
 
     /** Variable values expected for DEVICE. */
-    private const EXPECTED = [
+    public const EXPECTED = [
         'KesselFehlercode' => 0,
         'KesselAussentemperatur' => -3.5,
         'KesselGedaempfteAussentemperatur' => -1.2,
@@ -263,18 +263,25 @@ final class WCMConnectorTest extends TestCase
 
     /**
      * A chunk answered with one telegram less would shift all later buffer
-     * positions onto the wrong parameters. It must be rejected and retried.
+     * positions onto the wrong parameters. It must be rejected. The cycle
+     * fails without a retry (that would only add load), the values become
+     * invalid and the cyclic reading pauses.
      */
-    #[Group('slow')]
-    public function testIncompleteAnswerIsRetriedInsteadOfAssigningWrongValues(): void
+    public function testIncompleteAnswerFailsTheCycleInsteadOfAssigningWrongValues(): void
     {
         FakeWcm::reset(['device' => self::DEVICE, 'responses' => [['truncate' => 8]]]);
 
         $this->module->RetrieveWCMStatus(true);
 
-        $this->assertAllValuesAre(fn ($ident, $value) => $value);
-        $this->assertCount(5, FakeWcm::requests(), '4 chunks + 1 retry');
-        $this->assertSame([], \IpsFake::$log);
+        $this->assertAllValuesAre(fn () => 0);
+        $this->assertEqualsCanonicalizing(array_keys(self::EXPECTED), self::disabledIdents());
+        $this->assertCount(1, FakeWcm::requests(), 'No retry, no further chunk');
+        $this->assertCount(1, \IpsFake::$log);
+        $this->assertSame('WCM response contains 8 telegrams, expected 9.', \IpsFake::$log[0]['message']);
+
+        FakeWcm::reset(['device' => self::DEVICE]);
+        $this->module->RetrieveWCMStatus(true);
+        $this->assertSame([], FakeWcm::requests(), 'Pause after the failed cycle');
     }
 
     public function testErrorTelegramResetsOnlyThatVariable(): void

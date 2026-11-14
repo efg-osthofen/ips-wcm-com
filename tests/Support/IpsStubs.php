@@ -4,7 +4,7 @@
  * Minimal in-memory fake of the IP-Symcon runtime.
  *
  * It only covers what WCMConnector uses: properties, variables, timers,
- * variable profiles, semaphores and the message log.
+ * variable profiles, instance buffers, semaphores and the message log.
  */
 
 const KL_ERROR = 10206;
@@ -32,6 +32,9 @@ final class IpsFake
     /** @var list<array{instance:int, message:string, data:string}> */
     public static array $debug = [];
 
+    /** @var array<int, array<string, string>> [instanceId][name] => data, see SetBuffer() */
+    public static array $buffers = [];
+
     /** Number of IPS_SetDisabled calls */
     public static int $setDisabledCalls = 0;
 
@@ -46,6 +49,7 @@ final class IpsFake
         self::$semaphores = [];
         self::$log = [];
         self::$debug = [];
+        self::$buffers = [];
         self::$setDisabledCalls = 0;
         self::$nextId = 20000;
     }
@@ -221,6 +225,16 @@ class IPSModule
     protected function SendDebug(string $message, string $data, int $format)
     {
         IpsFake::$debug[] = ['instance' => $this->InstanceID, 'message' => $message, 'data' => $data];
+    }
+
+    protected function SetBuffer(string $name, string $data)
+    {
+        IpsFake::$buffers[$this->InstanceID][$name] = $data;
+    }
+
+    protected function GetBuffer(string $name): string
+    {
+        return IpsFake::$buffers[$this->InstanceID][$name] ?? '';
     }
 
     private function registerProperty(string $name, $default): void

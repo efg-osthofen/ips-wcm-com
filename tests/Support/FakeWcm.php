@@ -11,6 +11,14 @@ namespace Tests\Support;
  * MODULTYP/BUSKENNUNG/INFONR), answers read telegrams from it, applies write
  * telegrams to it and records every authenticated request. Single responses
  * can be overridden per scenario to provoke errors.
+ *
+ * Digest authentication: the server issues a new nonce with every 401 and
+ * only accepts nonces it issued. auth.jsonl records every request with its
+ * outcome, so tests can count the 401 round trips. Note that `php -S` closes
+ * the connection after every request (no keep-alive); reusing the curl handle
+ * still saves the 401 round trip because curl reuses the nonce.
+ * The server is single-threaded: after a client gave up on a delayed answer,
+ * the next request waits until that answer is done, so keep delays short.
  */
 final class FakeWcm
 {
@@ -79,13 +87,18 @@ final class FakeWcm
      *     auth?: bool,
      *     device?: array<string, int>,
      *     responses?: array<int, array<string, mixed>>,
+     *     delay?: float,
+     *     nonceUses?: int,
      * } $scenario
      *
      * device:    raw signed values keyed "MODULTYP/BUSKENNUNG/INFONR"
      * responses: per request index (0-based) either a raw reply
-     *            {status?, body?} or a device reply with modifications
-     *            {truncate?, command?, set?, removeField?, appendField?, appendTelegram?, pretty?}
+     *            {status?, body?, delay?} or a device reply with modifications
+     *            {truncate?, command?, set?, removeField?, appendField?, appendTelegram?, pretty?, delay?}
      *            set: [telegramIndex => [fieldIndex => value]]
+     * delay:     seconds every authenticated request waits before the answer
+     * nonceUses: a nonce is only accepted for this many requests, then the
+     *            server answers 401 with stale=true and a new nonce
      */
     public static function reset(array $scenario = []): void
     {
@@ -100,6 +113,8 @@ final class FakeWcm
         file_put_contents(self::$stateDir . '/scenario.json', json_encode($scenario));
         file_put_contents(self::$stateDir . '/device.json', json_encode((object) $scenario['device']));
         @unlink(self::$stateDir . '/requests.jsonl');
+        @unlink(self::$stateDir . '/auth.jsonl');
+        @unlink(self::$stateDir . '/nonces.json');
     }
 
     public static function url(): string
@@ -119,6 +134,32 @@ final class FakeWcm
             static fn (string $line) => json_decode($line, true),
             file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES)
         );
+    }
+
+    /** @return list<array{status:int, stale?:bool, nonce?:string, nc?:string}> every request with its authentication outcome */
+    public static function authLog(): array
+    {
+        $file = self::$stateDir . '/auth.jsonl';
+        if (!is_file($file)) {
+            return [];
+        }
+
+        return array_map(
+            static fn (string $line) => json_decode($line, true),
+            file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES)
+        );
+    }
+
+    /** Number of 401 digest challenges (each one an extra HTTP round trip and a new nonce). */
+    public static function challenges(): int
+    {
+        return count(array_filter(self::authLog(), static fn (array $entry) => $entry['status'] === 401));
+    }
+
+    /** @return list<string> nonce of every authenticated request */
+    public static function usedNonces(): array
+    {
+        return array_column(array_filter(self::authLog(), static fn (array $entry) => $entry['status'] === 200), 'nonce');
     }
 
     /** @return list<list<int>> every telegram of every authenticated request */
