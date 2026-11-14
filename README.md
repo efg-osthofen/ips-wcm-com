@@ -44,6 +44,8 @@ Ausgewählte Parameter (Betriebsart, Raumtemperaturen, Heizkurve, maximale Kesse
 | Nummer des ersten Heizkreises | Erster Heizkreis, für den Variablen angelegt werden | `2` |
 | Nummer des letzten Heizkreises | Letzter Heizkreis, für den Variablen angelegt werden | `5` |
 | Lesetakt seltener Parameter | Abstand in Minuten, in dem selten veränderte Parameter gelesen werden (siehe [Last auf dem WCM-COM](#last-auf-dem-wcm-com)). `0` liest sie in jedem Zyklus. | `15` |
+| Pause zwischen Blöcken | Wartezeit in Millisekunden zwischen zwei Anfragen eines Zyklus | `300` |
+| Telegramme pro Block | Telegramme pro HTTP-Anfrage (1–9) | `9` |
 
 Die zyklische Abfrage läuft nur, solange die Variable **Parameter Update** eingeschaltet ist und das Intervall größer als 0 ist.
 
@@ -174,36 +176,70 @@ Jede Antwort wird gegen die angefragten Info-Nummern geprüft.
 
 ### Last auf dem WCM-COM
 
-Das WCM-COM hat wenig Ressourcen und kann sich bei zu vielen Anfragen aufhängen (Port 80 bleibt offen, es antwortet aber nicht mehr, nur ein Stromreset der Heizung hilft).
-Das Modul hält deshalb die Last jeder Abfrage klein:
+Das WCM-COM hat wenig Ressourcen und kann sich bei zu vielen Anfragen aufhängen.
+Beim Ausfall bleiben Webserver und Anmeldung erreichbar, es kommen aber keine Werte mehr: Es hängt die Parameterabfrage über den eBus, nur ein Stromreset der Heizung hilft.
+Das Modul hält deshalb vor allem die eBus-Last klein und vermeidet Wiederholungen:
 
-- **Eine Verbindung pro Zyklus:** Alle Pakete eines Zyklus laufen über dasselbe cURL-Handle.
-  Nur die erste Anfrage braucht die 401-Runde der Digest-Authentifizierung, die folgenden verwenden die Nonce weiter.
-  Unterstützt das WCM-COM Keep-Alive, bleibt auch die TCP-Verbindung bestehen.
-  Bei Heizkreis 2–5 sind das 5 HTTP-Anfragen pro Zyklus (vorher 12).
-- **Seltene Parameter seltener:** Normal-Raumtemperatur, Raumfrosttemperatur, So/Wi-Umschalttemperatur, Steilheit und Max. Leistung Heizung/WW werden nur alle *Lesetakt seltener Parameter* Minuten gelesen.
+- **Weniger Telegramme:** Betriebsart je Heizkreis, Normal-Raumtemperatur, Raumfrosttemperatur, So/Wi-Umschalttemperatur, Steilheit, gedämpfte Außentemperatur und Max. Leistung Heizung/WW werden nur alle *Lesetakt seltener Parameter* Minuten gelesen.
   Dazwischen behalten die Variablen ihren Wert und bleiben aktiv.
   Nach dem Einschalten von **Parameter Update** und nach einem Fehler werden sie sofort gelesen.
   Ein geschriebener Wert wird im nächsten Zyklus einmal vom Gerät zurückgelesen.
-- **Zeitlimits:** Verbindungsaufbau höchstens 3 s, eine Anfrage höchstens 8 s, ein ganzer Lesezyklus höchstens 8 s.
-  So endet ein Zyklus vor dem Timeout der Semaphore (10 s) und vor dem nächsten Intervall.
+  Bei Heizkreis 2–5 sind das 23 statt 46 Telegramme pro Zyklus (3 statt 6 Blöcke).
 - **Pause statt Wiederholung:** Ein Lesezyklus wird nicht wiederholt.
-  Scheitert er (Zeitüberschreitung, keine Verbindung, HTTP-Fehler, „server is busy“, unpassende Antwort), wird der Fehler im IP-Symcon-Log protokolliert, alle Werte werden auf `0` gesetzt und deaktiviert.
+  Scheitert er, wird der Fehler im IP-Symcon-Log protokolliert, alle Werte werden auf `0` gesetzt und deaktiviert.
+  Als gescheitert gilt auch ein Zyklus, in dem das WCM-COM zwar antwortet, aber keinen einzigen gültigen Messwert liefert (nur ERROR- oder N/V-Telegramme; Fehlercode, Laststellung und Betriebsart zählen dabei nicht, weil sie kein N/V melden können).
   Danach pausiert die zyklische Abfrage 1 min, nach weiteren Fehlern 2 min und dann jeweils 5 min.
   Während der Pause bleiben die Variablen deaktiviert und werden nicht aktualisiert.
   Der erste erfolgreiche Zyklus beendet die Pause; **Parameter Update** einschalten beendet sie sofort.
+- **Großzügige Zeitlimits, nie parallel:** Verbindungsaufbau höchstens 3 s, eine Anfrage höchstens 15 s.
+  Eine laufende Anfrage wird nicht vorzeitig abgebrochen, damit das WCM-COM keine Anfragen weiterbearbeitet, die das Modul schon aufgegeben hat.
+  Nach 10 s Zyklusdauer startet keine weitere Anfrage mehr; der Zyklus gilt dann als gescheitert („zu langsam“).
+  Die Blöcke laufen nacheinander mit *Pause zwischen Blöcken* (Standard 300 ms), damit das WCM-COM seine eBus-Warteschlange abarbeiten kann.
+- **Keine überlappenden Zyklen:** Läuft noch ein Zyklus oder ein Schreibzugriff, wird der Timerlauf sofort übersprungen.
+  Dauert ein Zyklus länger als das Intervall, sinkt die Abfragerate dadurch von selbst.
+  Schreibzugriffe und das Einschalten von **Parameter Update** warten bis zu 30 s auf einen laufenden Zyklus.
+- **Eine Verbindung pro Zyklus:** Alle Blöcke eines Zyklus laufen über dasselbe cURL-Handle.
+  Nur die erste Anfrage braucht die 401-Runde der Digest-Authentifizierung, die folgenden verwenden die Nonce weiter.
+  Unterstützt das WCM-COM Keep-Alive, bleibt auch die TCP-Verbindung bestehen.
 - **Schreiben:** Bei HTTP-Fehlern, „server is busy“ oder unpassender Antwort wird bis zu 10-mal mit 1–2 s Pause wiederholt.
   Antwortet das WCM-COM gar nicht, wird nicht wiederholt und die zyklische Abfrage pausiert wie nach einem fehlgeschlagenen Lesezyklus.
   Schreiben ist auch während einer Pause möglich.
 
-Im Debug-Fenster der Instanz steht nach jedem Zyklus eine Zeile mit Telegrammen, Paketen, HTTP-Anfragen (einschließlich 401-Runden), neu aufgebauten Verbindungen und Dauer, z. B.:
+*Telegramme pro Block* (1–9) und *Pause zwischen Blöcken* sind für Versuche im Betrieb gedacht.
+Kleinere Blöcke senken die eBus-Last nicht (die Zahl der Telegramme bleibt gleich), sie verkürzen nur die einzelne Anfrage.
+
+#### Diagnose im Debug-Fenster
+
+Nach jedem Zyklus steht im Debug-Fenster der Instanz eine Zeile mit Telegrammen, Blöcken und der Dauer jedes Blocks, HTTP-Anfragen (einschließlich 401-Runden), neu aufgebauten Verbindungen, Gesamtdauer sowie der Zahl der ERROR- und N/V-Telegramme, z. B.:
 
 ```
-Zyklus OK: 28 Telegramme, 4/4 Blöcke, 5 HTTP-Anfragen, 1 Verbindung(en), 1,84 s, seltene Parameter: keine
-Zyklus fehlgeschlagen (Timeout): CURL error occurred: ... | 28 Telegramme, 2/4 Blöcke, 3 HTTP-Anfragen, 1 Verbindung(en), 8,00 s | Pause 60 s (Fehler Nr. 1)
+Zyklus OK: 23 Telegramme, 3/3 Blöcke (1,21 + 1,18 + 0,74 s), 4 HTTP-Anfragen, 1 Verbindung(en), 3,73 s, ERROR 0, N/V 1, seltene Parameter: keine
+```
+
+Scheitert ein Zyklus, steht davor die letzte Rohantwort des WCM-COM (gekürzt auf 500 Zeichen) und danach die Art des Fehlers mit dem betroffenen Block:
+
+```
+Letzte Antwort des WCM-COM (HTTP 200): {"prot":"coco","telegramm":[[0,0,1,1,0,0,0,0],[6,1,255,15,...
+Zyklus fehlgeschlagen (nur ERROR/N/V): WCM-COM lieferte keine gültigen Werte (2 ERROR, 13 N/V). | 23 Telegramme, 3/3 Blöcke (...) | Pause 60 s (Fehler Nr. 1)
+Keine Antwort des WCM-COM
+Zyklus fehlgeschlagen (Antwort-Timeout in Block 2/3): CURL error occurred: Operation timed out ... | ... | Pause 120 s (Fehler Nr. 2)
 Pause nach Fehler, nächster Versuch in 45 s
 ```
 
+| Fehlerart | Bedeutung |
+|---|---|
+| `Verbindungs-Timeout` | keine TCP-Verbindung innerhalb von 3 s |
+| `keine Verbindung` | Verbindung abgelehnt oder anderer Netzwerkfehler |
+| `Antwort-Timeout` | Anfrage gesendet, aber keine Antwort innerhalb von 15 s |
+| `HTTP-Fehler <Code>` | Antwort mit anderem HTTP-Status als 200 |
+| `Server busy` | Antwort „server is busy“ |
+| `unvollständige Antwort` | weniger Telegramme als angefragt |
+| `unpassende Antwort` | andere oder zusätzliche Telegramme |
+| `ungültige Antwort` | kein gültiges JSON, leere Telegrammliste oder fehlerhaftes Telegramm |
+| `zu langsam` | nach 10 s keine weitere Anfrage gestartet |
+| `nur ERROR/N/V` | Antwort ohne einen einzigen gültigen Messwert |
+
+Die Dauer der einzelnen Blöcke zeigt, wie das WCM-COM arbeitet: etwa eine Sekunde pro Block deutet darauf hin, dass es auf den eBus wartet; wenige Millisekunden darauf, dass es gespeicherte Werte liefert und den eBus im Hintergrund abfragt.
 Zeigt die Zeile bei mehreren Blöcken nur 1 Verbindung, hält das WCM-COM die Verbindung offen (Keep-Alive).
 
 Rohwerte werden aus Low- und High-Byte als vorzeichenbehaftete 16-Bit-Zahl zusammengesetzt und je nach Parameter durch 10 oder 100 geteilt.
@@ -211,7 +247,7 @@ Der Rohwert `0x8000` bedeutet „N/V“ (nicht vorhanden, z. B. Fühler nicht an
 Meldet die Anlage für einen Parameter N/V oder einen Fehler, wird nur diese Variable auf `0` gesetzt und deaktiviert (siehe [Ungültige Werte](#ungültige-werte)), im Debug-Fenster der Instanz erscheint ein Hinweis.
 
 Eine Semaphore (`WCM_Communication`) sorgt dafür, dass immer nur eine Anfrage gleichzeitig an das WCM-COM geht.
-Ist sie belegt, wird ein zyklischer Lesevorgang übersprungen und beim nächsten Intervall nachgeholt.
+Ist sie belegt, wird ein zyklischer Lesevorgang sofort übersprungen und beim nächsten Intervall nachgeholt; Schreibzugriffe warten bis zu 30 s.
 
 ## Tests
 
@@ -225,8 +261,8 @@ composer test
 | Testsuite | Inhalt |
 |---|---|
 | `unit` | Aufbau der Lese- und Schreibtelegramme, Wertebereiche, Low-/High-Byte, Dekodierung und Skalierung je Info-Nummer |
-| `integration` | `sendBuffer()` über echtes HTTP gegen einen simulierten WCM-COM mit Digest-Authentifizierung: Aufteilung in Pakete, Fehler, Wiederholungen, gemeinsames cURL-Handle und Nonce, Zeitlimits |
-| `module` | `WCMConnector` in einer nachgebildeten IP-Symcon-Umgebung: Variablen, Profile, Timer, Lesen, Schreiben, Semaphore, Lesetakt seltener Parameter, Pause nach Fehlern |
+| `integration` | `sendBuffer()` über echtes HTTP gegen einen simulierten WCM-COM mit Digest-Authentifizierung: Aufteilung in Pakete, Fehler und ihre Art, Wiederholungen, gemeinsames cURL-Handle und Nonce, Zeitlimits, Blockgröße und -pause |
+| `module` | `WCMConnector` in einer nachgebildeten IP-Symcon-Umgebung: Variablen, Profile, Timer, Lesen, Schreiben, Semaphore, Lesetakt seltener Parameter, Pause nach Fehlern, Blockgröße und -pause, Fehlerarten im Debug |
 
 Der simulierte WCM-COM ([`tests/Support/fake-wcm-router.php`](tests/Support/fake-wcm-router.php)) läuft als PHP-Webserver.
 Er beantwortet Lesetelegramme aus einem kleinen Gerätespeicher, übernimmt Schreibtelegramme und kann gezielt fehlerhafte Antworten liefern.

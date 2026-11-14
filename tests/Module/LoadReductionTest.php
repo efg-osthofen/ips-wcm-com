@@ -20,14 +20,11 @@ final class LoadReductionTest extends TestCase
 {
     private const INSTANCE = 12345;
 
-    /** INFONR of NormalRaumtemperatur, Raumfrosttemperatur, So/Wi, Steilheit, MaxLeistung Heizung/WW */
-    private const SLOW_INFONR = [5, 2580, 278, 270, 319, 345];
-
-    private const SLOW_IDENTS = [
-        'NormalRaumtemperaturHK2', 'RaumfrosttemperaturHK2', 'SoWiUmschalttemperaturHK2', 'SteilheitHK2',
-        'NormalRaumtemperaturHK3', 'RaumfrosttemperaturHK3', 'SoWiUmschalttemperaturHK3', 'SteilheitHK3',
-        'KesselMaxLeistungHeizung', 'KesselMaxLeistungWW',
-    ];
+    /**
+     * INFONR of Betriebsart HK, NormalRaumtemperatur, Raumfrosttemperatur,
+     * So/Wi, Steilheit, Gedämpfte Außentemperatur, MaxLeistung Heizung/WW
+     */
+    private const SLOW_INFONR = [274, 5, 2580, 278, 270, 2572, 319, 345];
 
     private ClockedWCMConnector $module;
 
@@ -54,6 +51,7 @@ final class LoadReductionTest extends TestCase
             'UpdateInterval' => 15,
             'FirstHK' => 2,
             'LastHK' => 3,
+            'BlockPause' => 0,
         ]);
         $module->ApplyChanges();
 
@@ -133,11 +131,13 @@ final class LoadReductionTest extends TestCase
 
         $this->assertSame([9, 9, 9, 9, 9, 1], self::chunkSizes());
         $this->assertSame(1, FakeWcm::challenges());
-        $this->assertStringStartsWith('Zyklus OK: 46 Telegramme, 6/6 Blöcke, 7 HTTP-Anfragen, ', self::lastDebug());
-        $this->assertStringEndsWith(' s, seltene Parameter: alle', self::lastDebug());
+        $this->assertMatchesRegularExpression(
+            '#^Zyklus OK: 46 Telegramme, 6/6 Blöcke \((\d+,\d\d \+ ){5}\d+,\d\d s\), 7 HTTP-Anfragen, \d+ Verbindung\(en\), \d+,\d\d s, ERROR 0, N/V 0, seltene Parameter: alle$#',
+            self::lastDebug()
+        );
     }
 
-    public function testNormalCycleForHeizkreis2To5Needs5HttpRequests(): void
+    public function testNormalCycleForHeizkreis2To5Needs4HttpRequests(): void
     {
         \IpsFake::reset();
         $this->module = self::createModule(['FirstHK' => 2, 'LastHK' => 5]);
@@ -145,8 +145,9 @@ final class LoadReductionTest extends TestCase
 
         $this->cycleAfter(15);
 
-        $this->assertSame([9, 9, 9, 1], self::chunkSizes());
-        $this->assertStringStartsWith('Zyklus OK: 28 Telegramme, 4/4 Blöcke, 5 HTTP-Anfragen, ', self::lastDebug());
+        // 1 Fehlercode + 4 x 3 Heizkreis + 10 Kessel/Puffer
+        $this->assertSame([9, 9, 5], self::chunkSizes());
+        $this->assertMatchesRegularExpression('#^Zyklus OK: 23 Telegramme, 3/3 Blöcke \(.*\), 4 HTTP-Anfragen, #', self::lastDebug());
     }
 
     // --- Slow parameters ---------------------------------------------------
@@ -157,7 +158,7 @@ final class LoadReductionTest extends TestCase
 
         $this->cycleAfter(15);
 
-        $this->assertSame([9, 9, 2], self::chunkSizes());
+        $this->assertSame([9, 8], self::chunkSizes());
         $this->assertSame([], array_values(array_intersect(self::sentInfoNumbers(), self::SLOW_INFONR)));
         $this->assertSame([0, 0, 1, 1, 0, 0, 0, 0], FakeWcm::sentTelegrams()[0], 'Fehlercode stays first');
         $this->assertStringEndsWith('seltene Parameter: keine', self::lastDebug());
@@ -189,7 +190,7 @@ final class LoadReductionTest extends TestCase
 
         FakeWcm::reset(['device' => WCMConnectorTest::DEVICE]);
         $this->cycleAfter(15);
-        $this->assertSame(20, count(FakeWcm::sentTelegrams()), 'Next 15 minutes start now');
+        $this->assertSame(17, count(FakeWcm::sentTelegrams()), 'Next 15 minutes start now');
     }
 
     public function testSlowParameterIntervalIsConfigurable(): void
@@ -199,7 +200,7 @@ final class LoadReductionTest extends TestCase
         $this->switchOn();
 
         $this->cycleAfter(4 * 60 + 59);
-        $this->assertCount(20, FakeWcm::sentTelegrams());
+        $this->assertCount(17, FakeWcm::sentTelegrams());
 
         FakeWcm::reset(['device' => WCMConnectorTest::DEVICE]);
         $this->cycleAfter(1);
@@ -241,7 +242,7 @@ final class LoadReductionTest extends TestCase
 
         $this->cycleAfter(15);
 
-        $this->assertCount(21, FakeWcm::sentTelegrams());
+        $this->assertCount(18, FakeWcm::sentTelegrams());
         $this->assertContains([6, 1, 1, 270, 0, 0, 0, 0], FakeWcm::sentTelegrams(), 'Read telegram for SteilheitHK2');
         $this->assertSame([270], array_values(array_intersect(self::sentInfoNumbers(), self::SLOW_INFONR)), 'Only the written parameter');
         $this->assertEqualsWithDelta(14.1, self::value('SteilheitHK2'), 1e-9, 'Value of the device');
@@ -249,7 +250,7 @@ final class LoadReductionTest extends TestCase
 
         FakeWcm::reset(['device' => WCMConnectorTest::DEVICE]);
         $this->cycleAfter(15);
-        $this->assertCount(20, FakeWcm::sentTelegrams(), 'Read back only once');
+        $this->assertCount(17, FakeWcm::sentTelegrams(), 'Read back only once');
     }
 
     public function testPublicMaxLeistungFunctionIsReadBackInNextCycle(): void
@@ -277,7 +278,7 @@ final class LoadReductionTest extends TestCase
 
         $this->cycleAfter(15);
 
-        $this->assertCount(20, FakeWcm::sentTelegrams());
+        $this->assertCount(17, FakeWcm::sentTelegrams());
     }
 
     // --- Pause after errors --------------------------------------------------
@@ -292,8 +293,9 @@ final class LoadReductionTest extends TestCase
         $this->assertCount(1, FakeWcm::requests(), 'No retry, no further chunk');
         // Slow parameters were not requested in this cycle, they become invalid as well
         $this->assertAllInvalid();
-        $this->assertStringStartsWith('Zyklus fehlgeschlagen (Fehlerhafte Antwort): HTTP return code 500', self::lastDebug());
-        $this->assertStringContainsString('| 20 Telegramme, 0/3 Blöcke, 2 HTTP-Anfragen, ', self::lastDebug());
+        $this->assertStringStartsWith('Zyklus fehlgeschlagen (HTTP-Fehler 500 in Block 1/2): HTTP return code 500', self::lastDebug());
+        $this->assertStringContainsString('| 17 Telegramme, 0/2 Blöcke (', self::lastDebug());
+        $this->assertStringContainsString(' s), 2 HTTP-Anfragen, ', self::lastDebug());
         $this->assertStringEndsWith('| Pause 60 s (Fehler Nr. 1)', self::lastDebug());
         $this->assertCount(1, \IpsFake::$log);
     }
@@ -363,7 +365,7 @@ final class LoadReductionTest extends TestCase
         FakeWcm::reset(['responses' => [['body' => 'server is busy']]]);
 
         $this->cycleAfter(15);
-        $this->assertStringStartsWith('Zyklus fehlgeschlagen (Server busy): WCM-COM server is busy.', self::lastDebug());
+        $this->assertStringStartsWith('Zyklus fehlgeschlagen (Server busy in Block 1/2): WCM-COM server is busy.', self::lastDebug());
         $this->assertAllInvalid();
 
         $this->cycleAfter(15);
@@ -378,7 +380,7 @@ final class LoadReductionTest extends TestCase
         $this->cycleAfter(15);
         usleep(400000); // let the fake server finish the delayed answer
 
-        $this->assertStringStartsWith('Zyklus fehlgeschlagen (Timeout): CURL error occurred', self::lastDebug());
+        $this->assertStringStartsWith('Zyklus fehlgeschlagen (Antwort-Timeout in Block 1/2): CURL error occurred', self::lastDebug());
         $this->assertCount(1, FakeWcm::requests());
         $this->assertAllInvalid();
     }
@@ -390,7 +392,7 @@ final class LoadReductionTest extends TestCase
 
         $this->cycleAfter(15);
 
-        $this->assertStringStartsWith('Zyklus fehlgeschlagen (keine Verbindung): CURL error occurred', self::lastDebug());
+        $this->assertStringStartsWith('Zyklus fehlgeschlagen (keine Verbindung in Block 1/4): CURL error occurred', self::lastDebug());
         $this->assertStringEndsWith('| Pause 60 s (Fehler Nr. 1)', self::lastDebug());
         $this->assertAllInvalid();
     }
@@ -434,7 +436,7 @@ final class LoadReductionTest extends TestCase
 
         $this->assertCount(1, FakeWcm::requests(), 'No retry');
         $this->assertEqualsWithDelta(12.5, self::value('SteilheitHK2'), 1e-9, 'Keeps the old value');
-        $this->assertStringStartsWith('Schreiben fehlgeschlagen (Timeout): CURL error occurred', self::lastDebug());
+        $this->assertStringStartsWith('Schreiben fehlgeschlagen (Antwort-Timeout): CURL error occurred', self::lastDebug());
         $this->assertSame([], \IpsFake::$semaphores);
 
         FakeWcm::reset(['device' => WCMConnectorTest::DEVICE]);
@@ -442,16 +444,201 @@ final class LoadReductionTest extends TestCase
         $this->assertSame([], FakeWcm::requests(), 'Reading pauses');
     }
 
-    // --- Time limits ---------------------------------------------------------
+    // --- Time limits and overlapping cycles -----------------------------------
 
-    /** A cycle must end before the semaphore timeout (10 s) and the update interval (15 s). */
-    public function testTimeLimitsOfTheModuleFitIntoTheSemaphoreTimeout(): void
+    /**
+     * Generous request timeout: the WCM-COM should not keep working on
+     * requests the module already gave up. No new request after 10 s.
+     */
+    public function testTimeLimitsOfTheModule(): void
     {
         $constant = fn (string $name) => (new \ReflectionClassConstant(\WCMConnector::class, $name))->getValue();
 
         $this->assertSame(3.0, $constant('CONNECT_TIMEOUT'));
-        $this->assertSame(8.0, $constant('REQUEST_TIMEOUT'));
-        $this->assertLessThan(10.0, $constant('CYCLE_TIME_BUDGET'));
-        $this->assertLessThan($constant('SEMAPHORE_TIMEOUT') / 1000, $constant('CYCLE_TIME_BUDGET'));
+        $this->assertSame(15.0, $constant('REQUEST_TIMEOUT'));
+        $this->assertSame(10.0, $constant('NEW_REQUEST_LIMIT'));
+    }
+
+    /** The timer does not wait for a running cycle: cycles never overlap, the run is skipped. */
+    public function testTimerDoesNotWaitForTheSemaphore(): void
+    {
+        \IpsFake::$semaphoreWaits = [];
+
+        $this->module->RetrieveWCMStatus(true);
+
+        $this->assertSame([0], \IpsFake::$semaphoreWaits);
+    }
+
+    public function testWritesWaitUpToThirtySecondsForARunningCycle(): void
+    {
+        \IpsFake::$semaphoreWaits = [];
+
+        $this->module->RequestAction('SteilheitHK2', 14.0);
+        $this->module->UpdateWCMMaxLeistungWW(70);
+        $this->module->RequestAction('ParameterUpdate', true);
+
+        $this->assertSame([30000, 30000, 30000], \IpsFake::$semaphoreWaits);
+    }
+
+    public function testNoNewRequestAfterTheLimitFailsTheCycle(): void
+    {
+        // ClockedWCMConnector: no new request after 2 s; each block takes 0.35 s,
+        // so block 6 starts at 1.75 s and is answered at 2.1 s
+        \IpsFake::reset();
+        $this->module = self::createModule(['BlockSize' => 3]);
+        FakeWcm::reset(['device' => WCMConnectorTest::DEVICE, 'delay' => 0.35]);
+
+        $this->cycleAfter(15);
+
+        $this->assertCount(6, FakeWcm::requests(), 'The running request finishes, no 7th request');
+        $this->assertStringStartsWith('Zyklus fehlgeschlagen (zu langsam in Block 7/10): No further request after 2.0 s, 6 of 10 blocks answered.', self::lastDebug());
+        $this->assertAllInvalid();
+    }
+
+    // --- Block size and pause between blocks ---------------------------------
+
+    public function testBlockSizeIsConfigurable(): void
+    {
+        \IpsFake::reset();
+        $this->module = self::createModule(['BlockSize' => 4]);
+
+        $this->cycleAfter(15);
+
+        $this->assertSame([4, 4, 4, 4, 4, 4, 4, 2], self::chunkSizes());
+        $this->assertAllValid();
+    }
+
+    public function testBlockSizeIsLimitedToNine(): void
+    {
+        \IpsFake::reset();
+        $this->module = self::createModule(['BlockSize' => 20]);
+
+        $this->cycleAfter(15);
+
+        $this->assertSame([9, 9, 9, 3], self::chunkSizes());
+    }
+
+    public function testPauseBetweenBlocks(): void
+    {
+        \IpsFake::reset();
+        $this->module = self::createModule(['BlockPause' => 250]);
+
+        $this->cycleAfter(15);
+
+        $times = FakeWcm::requestTimes();
+        $this->assertCount(4, $times);
+        for ($i = 1; $i < 4; $i++) {
+            $this->assertGreaterThanOrEqual(0.25, $times[$i] - $times[$i - 1], "Pause before block " . ($i + 1));
+        }
+        $this->assertAllValid();
+    }
+
+    public function testDefaultPauseBetweenBlocksIs300Milliseconds(): void
+    {
+        $module = new \WCMConnector(self::INSTANCE + 1);
+        $module->Create();
+
+        $this->assertSame(300, \IpsFake::$properties[self::INSTANCE + 1]['BlockPause']);
+        $this->assertSame(9, \IpsFake::$properties[self::INSTANCE + 1]['BlockSize']);
+        $this->assertSame(15, \IpsFake::$properties[self::INSTANCE + 1]['SlowParameterInterval']);
+    }
+
+    // --- How a cycle fails (debug) ---------------------------------------------
+
+    /**
+     * The WCM-COM answers, but its eBus side delivers nothing: an outage,
+     * not a list of missing sensors. Laststellung is a raw value without N/V
+     * and reads 0 here; it doesn't count as a valid measured value.
+     */
+    public function testAnswerWithOnlyErrorAndNotAvailableTelegramsIsAnOutage(): void
+    {
+        $this->switchOn();
+        $notAvailable = array_map(fn () => -32768, WCMConnectorTest::DEVICE);
+        FakeWcm::reset(['device' => ['0/0/1' => 0] + $notAvailable, 'responses' => [['set' => [1 => [2 => 255], 2 => [2 => 255]]]]]);
+
+        $this->cycleAfter(15);
+
+        $this->assertAllInvalid();
+        $this->assertCount(2, FakeWcm::requests(), 'Both blocks were answered');
+        $this->assertStringStartsWith('Zyklus fehlgeschlagen (nur ERROR/N/V): WCM-COM lieferte keine gültigen Werte (2 ERROR, 13 N/V). | 17 Telegramme, 2/2 Blöcke', self::lastDebug());
+        $this->assertSame('WCM-COM lieferte keine gültigen Werte (2 ERROR, 13 N/V).', \IpsFake::$log[0]['message']);
+
+        FakeWcm::reset(['device' => WCMConnectorTest::DEVICE]);
+        $this->cycleAfter(15);
+        $this->assertSame([], FakeWcm::requests(), 'Pause');
+    }
+
+    public function testAnswerWithOnlyErrorTelegramsIsAnOutage(): void
+    {
+        $this->switchOn();
+        FakeWcm::reset(['device' => WCMConnectorTest::DEVICE, 'responses' => [['command' => 255], ['command' => 255]]]);
+
+        $this->cycleAfter(15);
+
+        $this->assertAllInvalid();
+        $this->assertStringStartsWith('Zyklus fehlgeschlagen (nur ERROR/N/V): WCM-COM lieferte keine gültigen Werte (17 ERROR, 0 N/V).', self::lastDebug());
+    }
+
+    public function testSingleErrorAndNotAvailableTelegramsAreCountedButNoOutage(): void
+    {
+        $this->switchOn(['3/0/118' => -32768] + WCMConnectorTest::DEVICE);
+
+        $this->cycleAfter(15);
+
+        $this->assertSame(['PufferB10Oben'], self::disabledIdents());
+        $this->assertMatchesRegularExpression('#, ERROR 0, N/V 1, seltene Parameter: keine$#', self::lastDebug());
+        $this->assertSame([], \IpsFake::$log);
+    }
+
+    public static function failures(): iterable
+    {
+        yield 'HTTP-Fehler' => [['status' => 503, 'body' => 'Service Unavailable'], 'HTTP-Fehler 503 in Block 1/2', 'Letzte Antwort des WCM-COM (HTTP 503): Service Unavailable'];
+        yield 'Server busy' => [['body' => 'server is busy'], 'Server busy in Block 1/2', 'Letzte Antwort des WCM-COM (HTTP 200): server is busy'];
+        yield 'unvollständig' => [['truncate' => 5], 'unvollständige Antwort in Block 1/2', 'Letzte Antwort des WCM-COM (HTTP 200): {"prot":"coco","telegramm":[[0,0,1,1,'];
+        yield 'unpassend' => [['set' => [3 => [3 => 13]]], 'unpassende Antwort in Block 1/2', 'Letzte Antwort des WCM-COM (HTTP 200): {"prot":"coco"'];
+        yield 'zusätzliches Telegramm' => [['appendTelegram' => [10, 0, 1, 14, 0, 0, 0, 0]], 'unpassende Antwort in Block 1/2', 'Letzte Antwort des WCM-COM (HTTP 200): {"prot":"coco"'];
+        yield 'ungültiges JSON' => [['body' => '<html>Fehler</html>'], 'ungültige Antwort in Block 1/2', 'Letzte Antwort des WCM-COM (HTTP 200): <html>Fehler</html>'];
+        yield 'leere Antwort' => [['body' => '{"prot":"coco","telegramm":[]}'], 'ungültige Antwort in Block 1/2', 'Letzte Antwort des WCM-COM (HTTP 200): {"prot":"coco","telegramm":[]}'];
+        yield 'leerer Body' => [['status' => 200, 'body' => ''], 'ungültige Antwort in Block 1/2', 'Letzte Antwort des WCM-COM (HTTP 200): (leer)'];
+    }
+
+    /** Each kind of failure is named, the raw answer is shown before the summary. */
+    #[\PHPUnit\Framework\Attributes\DataProvider('failures')]
+    public function testDebugNamesTheKindOfFailureAndShowsTheAnswer(array $response, string $kind, string $answer): void
+    {
+        $this->switchOn();
+        FakeWcm::reset(['device' => WCMConnectorTest::DEVICE, 'responses' => [$response]]);
+
+        $this->cycleAfter(15);
+
+        $debug = array_column(\IpsFake::$debug, 'data');
+        $this->assertStringStartsWith("Zyklus fehlgeschlagen ($kind): ", end($debug));
+        $this->assertStringStartsWith($answer, prev($debug));
+        $this->assertCount(1, FakeWcm::requests(), 'No retry');
+        $this->assertAllInvalid();
+    }
+
+    public function testDebugShowsNoAnswerOnTimeout(): void
+    {
+        $this->switchOn();
+        FakeWcm::reset(['device' => WCMConnectorTest::DEVICE, 'responses' => [['delay' => 0.8]]]);
+
+        $this->cycleAfter(15);
+        usleep(400000);
+
+        $debug = array_column(\IpsFake::$debug, 'data');
+        $this->assertStringStartsWith('Zyklus fehlgeschlagen (Antwort-Timeout in Block 1/2): ', end($debug));
+        $this->assertSame('Keine Antwort des WCM-COM', prev($debug));
+    }
+
+    public function testLongAnswerIsShortenedInTheDebugOutput(): void
+    {
+        $this->switchOn();
+        FakeWcm::reset(['responses' => [['status' => 500, 'body' => str_repeat('x', 800)]]]);
+
+        $this->cycleAfter(15);
+
+        $debug = array_column(\IpsFake::$debug, 'data');
+        $this->assertSame('Letzte Antwort des WCM-COM (HTTP 500): ' . str_repeat('x', 500) . ' … (800 Zeichen)', $debug[count($debug) - 2]);
     }
 }

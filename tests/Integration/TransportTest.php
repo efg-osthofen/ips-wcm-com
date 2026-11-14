@@ -344,7 +344,7 @@ final class TransportTest extends TestCase
         try {
             $api->sendBuffer(3);
             $this->fail('Expected a timeout');
-        } catch (\WeishauptTimeoutException $e) {
+        } catch (\WeishauptResponseTimeoutException $e) {
             $this->assertStringContainsString('CURL error occurred', $e->getMessage());
         }
 
@@ -353,8 +353,11 @@ final class TransportTest extends TestCase
         usleep(800000); // let the fake server finish the delayed answer
     }
 
-    /** The time budget limits all chunks together, not each request. */
-    public function testTimeBudgetLimitsTheWholeBuffer(): void
+    /**
+     * A running request is never cut short (the WCM-COM would keep working on
+     * it), but no further request starts after the limit.
+     */
+    public function testNoNewRequestAfterTheLimitButTheRunningOneFinishes(): void
     {
         FakeWcm::reset(['delay' => 0.4]);
         $api = self::apiWithTelegrams(30);
@@ -362,29 +365,153 @@ final class TransportTest extends TestCase
         $start = microtime(true);
         try {
             $api->sendBuffer(1, 1.0);
-            $this->fail('Expected a timeout');
-        } catch (\WeishauptTimeoutException) {
+            $this->fail('Expected WeishauptTooSlowException');
+        } catch (\WeishauptTooSlowException $e) {
+            $this->assertSame('No further request after 1.0 s, 3 of 4 blocks answered.', $e->getMessage());
         }
-        $duration = microtime(true) - $start;
 
-        $this->assertGreaterThanOrEqual(0.95, $duration);
-        $this->assertLessThan(1.4, $duration);
-        $this->assertSame(2, $api->getLastStats()['sent_blocks']);
-        $this->assertCount(3, FakeWcm::requests(), 'Chunk 4 is not sent any more');
-        usleep(400000);
+        $this->assertGreaterThanOrEqual(1.2, microtime(true) - $start, 'Block 3 started at 0.8 s and was answered');
+        $this->assertCount(3, FakeWcm::requests(), 'Block 4 is not sent any more');
+        $this->assertSame(3, $api->getLastStats()['sent_blocks']);
+        $this->assertSame(4, $api->getLastStats()['failed_block']);
     }
 
-    public function testExhaustedTimeBudgetSendsNothingMore(): void
+    public function testLimitReachedBeforeTheFirstRequestSendsNothing(): void
     {
         $api = self::apiWithTelegrams(1);
 
-        $this->expectException(\WeishauptTimeoutException::class);
-        $this->expectExceptionMessage('Time budget of 0.0 s for sending the buffer exhausted.');
+        $this->expectException(\WeishauptTooSlowException::class);
+        $this->expectExceptionMessage('No further request after 0.0 s, 0 of 1 blocks answered.');
         try {
             $api->sendBuffer(1, 0.0);
         } finally {
             $this->assertSame([], FakeWcm::requests());
         }
+    }
+
+    public function testDefaultRequestTimeoutIsFifteenSeconds(): void
+    {
+        $options = new \WeishauptOptions('http://wcm', 'u', 'p');
+
+        $this->assertSame([3.0, 15.0, 9, 0.0], [$options->connectTimeout, $options->requestTimeout, $options->blockSize, $options->blockPause]);
+    }
+
+    // --- Block size and pause --------------------------------------------------
+
+    public function testBlockSizeIsConfigurable(): void
+    {
+        $api = new \Weishaupt(new \WeishauptOptions(FakeWcm::url(), FakeWcm::USERNAME, FakeWcm::PASSWORD, 3.0, 15.0, 4));
+        for ($heizkreis = 1; $heizkreis <= 10; $heizkreis++) {
+            $api->bufferedRequestVorlauftemperaturHK($heizkreis);
+        }
+
+        $this->assertCount(10, iterator_to_array($api->sendBuffer()->getIterator()));
+        $this->assertSame([4, 4, 2], array_map(fn ($r) => count($r['telegramm']), FakeWcm::requests()));
+    }
+
+    public function testBlockSizeIsLimitedToOneToNine(): void
+    {
+        $this->assertSame(9, (new \WeishauptOptions('http://wcm', 'u', 'p', 3.0, 15.0, 50))->blockSize);
+        $this->assertSame(1, (new \WeishauptOptions('http://wcm', 'u', 'p', 3.0, 15.0, 0))->blockSize);
+    }
+
+    public function testPauseBetweenBlocksButNotBeforeTheFirstOrAfterTheLast(): void
+    {
+        $api = new \Weishaupt(new \WeishauptOptions(FakeWcm::url(), FakeWcm::USERNAME, FakeWcm::PASSWORD, 3.0, 15.0, 9, 0.3));
+        for ($heizkreis = 1; $heizkreis <= 20; $heizkreis++) {
+            $api->bufferedRequestVorlauftemperaturHK($heizkreis);
+        }
+
+        $start = microtime(true);
+        $api->sendBuffer();
+        $duration = microtime(true) - $start;
+
+        $times = FakeWcm::requestTimes();
+        $this->assertGreaterThanOrEqual(0.3, $times[1] - $times[0]);
+        $this->assertGreaterThanOrEqual(0.3, $times[2] - $times[1]);
+        $this->assertGreaterThanOrEqual(0.6, $duration);
+        $this->assertLessThan(0.85, $duration, 'Two pauses for three blocks');
+    }
+
+    // --- Kind of failure and statistics -----------------------------------------
+
+    public function testHttpErrorCarriesTheStatusCode(): void
+    {
+        FakeWcm::reset(['responses' => [['status' => 503, 'body' => 'unavailable']]]);
+        $api = self::apiWithTelegrams(1);
+
+        try {
+            $api->sendBuffer(1);
+            $this->fail('Expected WeishauptHttpException');
+        } catch (\WeishauptHttpException $e) {
+            $this->assertSame(503, $e->httpCode);
+            $this->assertSame("HTTP return code 503\nunavailable", $e->getMessage());
+        }
+        $stats = $api->getLastStats();
+        $this->assertSame([503, 'unavailable', 1], [$stats['http_code'], $stats['body'], $stats['failed_block']]);
+    }
+
+    public function testResponseTimeoutIsDistinguishedFromConnectionErrors(): void
+    {
+        FakeWcm::reset(['delay' => 0.6]);
+        $api = self::apiWithTelegrams(1, requestTimeout: 0.3);
+
+        try {
+            $api->sendBuffer(1);
+            $this->fail('Expected WeishauptResponseTimeoutException');
+        } catch (\WeishauptResponseTimeoutException) {
+        }
+        $this->assertNull($api->getLastStats()['body'], 'No answer');
+        usleep(400000);
+    }
+
+    public static function invalidAnswers(): iterable
+    {
+        yield 'incomplete' => [['truncate' => 1], 'incomplete'];
+        yield 'other telegram' => [['set' => [1 => [3 => 13]]], 'mismatch'];
+        yield 'additional telegram' => [['appendTelegram' => [10, 0, 1, 14, 0, 0, 0, 0]], 'mismatch'];
+        yield 'empty telegram list' => [['body' => '{"prot":"coco","telegramm":[]}'], 'invalid'];
+        yield 'malformed telegram' => [['removeField' => [0, 7]], 'invalid'];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('invalidAnswers')]
+    public function testInvalidAnswersAreClassified(array $response, string $kind): void
+    {
+        FakeWcm::reset(['responses' => [$response]]);
+        $api = self::api();
+        $api->bufferedRequestAussentemperatur();
+        $api->bufferedRequestRuecklauftemperatur();
+
+        try {
+            $api->sendBuffer(1);
+            $this->fail('Expected WeishauptResponseException');
+        } catch (\WeishauptResponseException $e) {
+            $this->assertSame($kind, $e->kind);
+        }
+        $this->assertNotNull($api->getLastStats()['body']);
+    }
+
+    public function testInvalidJsonIsReportedAsJsonException(): void
+    {
+        FakeWcm::reset(['responses' => [['body' => '<html>Fehler</html>']]]);
+        $api = self::apiWithTelegrams(1);
+
+        $this->expectException(\JsonException::class);
+        $api->sendBuffer(1);
+    }
+
+    public function testBlockDurationsAreRecorded(): void
+    {
+        FakeWcm::reset(['responses' => [[], ['delay' => 0.3]]]);
+        $api = self::apiWithTelegrams(20);
+
+        $api->sendBuffer();
+        $durations = $api->getLastStats()['block_durations'];
+
+        $this->assertCount(3, $durations);
+        $this->assertGreaterThanOrEqual(0.3, $durations[1]);
+        $this->assertLessThan(0.3, $durations[2]);
+        $this->assertNull($api->getLastStats()['failed_block']);
     }
 
     public function testUnreachableDeviceIsNotRetried(): void

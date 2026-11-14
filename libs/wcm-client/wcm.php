@@ -9,24 +9,63 @@ class WeishauptOptions {
     public float $connectTimeout;
     /** Seconds one HTTP request may take in total (including the connection) */
     public float $requestTimeout;
+    /** Telegrams per HTTP request (1-9) */
+    public int $blockSize;
+    /** Seconds to wait between two blocks, gives the WCM-COM time for its eBus queue */
+    public float $blockPause;
     
-    public function __construct(string $url, string $username, string $password, float $connectTimeout = 3.0, float $requestTimeout = 8.0) {
+    public function __construct(string $url, string $username, string $password, float $connectTimeout = 3.0, float $requestTimeout = 15.0, int $blockSize = 9, float $blockPause = 0.0) {
         $this->url = $url;
         $this->username = $username;
         $this->password = $password;
         $this->connectTimeout = $connectTimeout;
         $this->requestTimeout = $requestTimeout;
+        $this->blockSize = max(1, min(9, $blockSize));
+        $this->blockPause = max(0.0, $blockPause);
     }
 }
 
 /** The WCM-COM did not answer at all (connection failed, timeout). Not retried. */
 class WeishauptConnectionException extends Exception {}
 
-/** The WCM-COM did not answer in time, or the time budget of sendBuffer() ran out. */
+/** The WCM-COM did not answer in time. */
 class WeishauptTimeoutException extends WeishauptConnectionException {}
+
+/** No TCP connection within the connect timeout. */
+class WeishauptConnectTimeoutException extends WeishauptTimeoutException {}
+
+/** The request was sent, but the answer did not arrive within the request timeout. */
+class WeishauptResponseTimeoutException extends WeishauptTimeoutException {}
+
+/** The WCM-COM answered with an HTTP status other than 200. */
+class WeishauptHttpException extends Exception {
+    public int $httpCode;
+
+    public function __construct(int $httpCode, string $message) {
+        parent::__construct($message);
+        $this->httpCode = $httpCode;
+    }
+}
 
 /** The WCM-COM answered "server is busy". */
 class WeishauptBusyException extends Exception {}
+
+/**
+ * The answer does not fit the request: "incomplete" (fewer telegrams),
+ * "mismatch" (other or additional telegrams) or "invalid" (no telegram list,
+ * malformed telegram). Invalid JSON is reported as JsonException.
+ */
+class WeishauptResponseException extends Exception {
+    public string $kind;
+
+    public function __construct(string $kind, string $message) {
+        parent::__construct($message);
+        $this->kind = $kind;
+    }
+}
+
+/** sendBuffer() did not start the next block because the time limit for new blocks was reached. */
+class WeishauptTooSlowException extends Exception {}
 
 class TelegramObject {
     public int $MODULTYP;
@@ -91,6 +130,8 @@ class Weishaupt {
     private string $password;
     private float $connectTimeout;
     private float $requestTimeout;
+    private int $blockSize;
+    private float $blockPause;
     
     private array $telegramRequestBuffer = [];
 
@@ -114,6 +155,8 @@ class Weishaupt {
         $this->password = $options->password;
         $this->connectTimeout = $options->connectTimeout;
         $this->requestTimeout = $options->requestTimeout;
+        $this->blockSize = $options->blockSize;
+        $this->blockPause = $options->blockPause;
         $this->lastStats = self::emptyStats(0, 0);
         $this->responseCounter = new stdClass();
         $this->responseCounter->count = 0;
@@ -123,7 +166,10 @@ class Weishaupt {
      * Statistics of the last sendBuffer() call:
      * telegrams, blocks (planned), sent_blocks (answered successfully),
      * http_requests (including 401 challenges and retries), connections (new
-     * TCP connections) and duration (seconds).
+     * TCP connections), duration (seconds, including pauses between blocks),
+     * block_durations (seconds per started block, including retries),
+     * failed_block (1-based, null if all blocks succeeded), and http_code and
+     * body of the last answer (body null if there was no answer).
      */
     public function getLastStats(): array {
         return $this->lastStats;
@@ -144,6 +190,10 @@ class Weishaupt {
             'http_requests' => 0,
             'connections' => 0,
             'duration' => 0.0,
+            'block_durations' => [],
+            'failed_block' => null,
+            'http_code' => 0,
+            'body' => null,
         ];
     }
 
@@ -449,86 +499,105 @@ class Weishaupt {
     /**
      * Sends buffered telegrams to WCM-COM (Reads and Updates)
      *
-     * A chunk that fails with an HTTP error, "server is busy" or an invalid
-     * answer is sent again after a pause of 1-2 s, up to $NUM_OF_ATTEMPTS times
-     * in total. If the WCM-COM does not answer at all (connection error,
-     * timeout), there is no further attempt: it would only add load to a device
-     * that already struggles.
+     * Blocks are sent one after the other, never in parallel, with the
+     * configured pause in between. A block that fails with an HTTP error,
+     * "server is busy" or an invalid answer is sent again after a pause of
+     * 1-2 s, up to $NUM_OF_ATTEMPTS times in total. If the WCM-COM does not
+     * answer at all (connection error, timeout), there is no further attempt:
+     * it would only add load to a device that already struggles.
      *
-     * @param int $NUM_OF_ATTEMPTS attempts per chunk
-     * @param float|null $timeBudget seconds all requests together may take, null for no limit
+     * A running request is never cut short (only by the request timeout), so
+     * the WCM-COM does not keep working on a request the client gave up.
+     * Instead, no further request is started once $newRequestLimit seconds
+     * have passed.
+     *
+     * @param int $NUM_OF_ATTEMPTS attempts per block
+     * @param float|null $newRequestLimit seconds after which no further request is started, null for no limit
      * @throws WeishauptConnectionException if the WCM-COM did not answer (WeishauptTimeoutException: in time)
-     * @throws WeishauptBusyException if the WCM-COM is busy
+     * @throws WeishauptHttpException, WeishauptBusyException, WeishauptResponseException, JsonException if it answered with an error
+     * @throws WeishauptTooSlowException if $newRequestLimit was reached
      */
-    public function sendBuffer($NUM_OF_ATTEMPTS = 3, ?float $timeBudget = null): FinalTelegramObjectCollection {
-        $chunks = array_chunk($this->telegramRequestBuffer, 9);
+    public function sendBuffer($NUM_OF_ATTEMPTS = 3, ?float $newRequestLimit = null): FinalTelegramObjectCollection {
+        $chunks = array_chunk($this->telegramRequestBuffer, $this->blockSize);
         $finalRes = new FinalTelegramObjectCollection();
 
         $start = microtime(true);
-        $deadline = $timeBudget === null ? null : $start + $timeBudget;
         $this->lastStats = self::emptyStats(count($this->telegramRequestBuffer), count($chunks));
         $responsesBefore = $this->responseCounter->count;
 
         try {
-            foreach($chunks as $chunk) {
+            foreach($chunks as $blockIndex => $chunk) {
+                if($blockIndex > 0 && $this->blockPause > 0) {
+                    usleep((int) round($this->blockPause * 1000000));
+                }
+
                 $body = [
                     "prot" => "coco",
                     "telegramm" => $chunk
                 ];
 
+                $blockStart = microtime(true);
                 $attempts = 0;
                 $lastError = null;
-                do {
-                    $timeout = $this->requestTimeout;
-                    if($deadline !== null) {
-                        $remaining = $deadline - microtime(true);
-                        if($remaining <= 0) {
+                try {
+                    do {
+                        if($newRequestLimit !== null && microtime(true) - $start >= $newRequestLimit) {
                             // Report the actual problem if a retry ran out of time
-                            throw $lastError ?? new WeishauptTimeoutException(sprintf("Time budget of %.1f s for sending the buffer exhausted.", $timeBudget));
+                            throw $lastError ?? new WeishauptTooSlowException(sprintf("No further request after %.1f s, %d of %d blocks answered.", $newRequestLimit, $this->lastStats['sent_blocks'], count($chunks)));
                         }
-                        $timeout = min($timeout, $remaining);
-                    }
 
-                    try {
-                        $res = $this->_callAPI("POST", $this->url."/parameter.json", $body, $timeout);
+                        try {
+                            $res = $this->_callAPI("POST", $this->url."/parameter.json", $body, $this->requestTimeout);
+                            $this->lastStats['http_code'] = (int) $res["http_code"];
+                            $this->lastStats['body'] = empty($res["curl_error"]) ? $res["body"] : null;
 
-                        // Throw exception if http or curl error occurred
-                        if ($res["http_code"] != 200) {
-                            if(!empty($res["curl_error"])) {
-                                $message = "CURL error occurred: ".$res["curl_error"];
-                                if($res["curl_errno"] == CURLE_OPERATION_TIMEDOUT) {
-                                    throw new WeishauptTimeoutException($message);
+                            // Throw exception if http or curl error occurred
+                            if ($res["http_code"] != 200) {
+                                if(!empty($res["curl_error"])) {
+                                    $message = "CURL error occurred: ".$res["curl_error"];
+                                    if($res["curl_errno"] == CURLE_OPERATION_TIMEDOUT) {
+                                        // Before the request could be sent: the connection was not established
+                                        if($res["request_sent"]) {
+                                            throw new WeishauptResponseTimeoutException($message);
+                                        }
+                                        throw new WeishauptConnectTimeoutException($message);
+                                    }
+                                    throw new WeishauptConnectionException($message);
+                                } else {
+                                    throw new WeishauptHttpException((int) $res["http_code"], "HTTP return code ".$res["http_code"]."\n".$res["body"]);
                                 }
-                                throw new WeishauptConnectionException($message);
-                            } else {
-                                throw new Exception("HTTP return code ".$res["http_code"]."\n".$res["body"]);
                             }
-                        }
 
-                        // If WCM-COM server is busy and doesn't return a response
-                        if(stripos($res["body"], "server is busy") !== false) {
-                            throw new WeishauptBusyException("WCM-COM server is busy.");
-                        } else {
-                            $resTelegramCol = $this->_decodeTelegram($res["body"]);
-                            $this->_verifyResponse($chunk, $resTelegramCol);
-                            $finalRes->addCollection($resTelegramCol);
-                            $this->lastStats['sent_blocks']++;
-                        }
-                    } catch(WeishauptConnectionException $e) {
-                        throw $e;
-                    } catch(Exception $e) {
-                        $attempts++;
-                        if($attempts >= $NUM_OF_ATTEMPTS) {
+                            // If WCM-COM server is busy and doesn't return a response
+                            if(stripos($res["body"], "server is busy") !== false) {
+                                throw new WeishauptBusyException("WCM-COM server is busy.");
+                            } else {
+                                $resTelegramCol = $this->_decodeTelegram($res["body"]);
+                                $this->_verifyResponse($chunk, $resTelegramCol);
+                                $finalRes->addCollection($resTelegramCol);
+                                $this->lastStats['sent_blocks']++;
+                            }
+                        } catch(WeishauptConnectionException $e) {
                             throw $e;
+                        } catch(Exception $e) {
+                            $attempts++;
+                            if($attempts >= $NUM_OF_ATTEMPTS) {
+                                throw $e;
+                            }
+                            $lastError = $e;
+                            usleep(rand(500000, 1000000));
+                            usleep(rand(500000, 1000000));
+                            continue;
                         }
-                        $lastError = $e;
-                        usleep(rand(500000, 1000000));
-                        usleep(rand(500000, 1000000));
-                        continue;
-                    }
 
-                    break;
-                } while(true);
+                        break;
+                    } while(true);
+                } catch(Exception $e) {
+                    $this->lastStats['failed_block'] = $blockIndex + 1;
+                    throw $e;
+                } finally {
+                    $this->lastStats['block_durations'][] = microtime(true) - $blockStart;
+                }
             }
         } finally {
             $this->lastStats['duration'] = microtime(true) - $start;
@@ -547,12 +616,12 @@ class Weishaupt {
         $responses = $responses->getIterator()->getArrayCopy();
 
         if(count($responses) !== count($requests)) {
-            throw new Exception("WCM response contains ".count($responses)." telegrams, expected ".count($requests).".");
+            throw new WeishauptResponseException(count($responses) < count($requests) ? "incomplete" : "mismatch", "WCM response contains ".count($responses)." telegrams, expected ".count($requests).".");
         }
 
         foreach($responses as $pos => $telegram) {
             if($telegram->INFONR != $requests[$pos][3]) {
-                throw new Exception("WCM response doesn't match the requests!");
+                throw new WeishauptResponseException("mismatch", "WCM response doesn't match the requests!");
             }
         }
     }
@@ -574,7 +643,7 @@ class Weishaupt {
         $decoded = json_decode($body, false, 512, JSON_THROW_ON_ERROR);
 
         if(!isset($decoded->telegramm) || !is_array($decoded->telegramm) || empty($decoded->telegramm)) {
-            throw new Exception("Invalid WCM response. Response is empty.");
+            throw new WeishauptResponseException("invalid", "Invalid WCM response. Response is empty.");
         }
 
         foreach($decoded->telegramm as $telegramEntry) {
@@ -582,7 +651,7 @@ class Weishaupt {
             if(!is_array($telegramEntry)
                 || count($telegramEntry) !== count(Type)
                 || count(array_filter($telegramEntry, 'is_int')) !== count(Type)) {
-                throw new Exception("Invalid telegram in WCM response: ".json_encode($telegramEntry));
+                throw new WeishauptResponseException("invalid", "Invalid telegram in WCM response: ".json_encode($telegramEntry));
             }
 
             $respObj = new TelegramObject();
@@ -775,11 +844,14 @@ class Weishaupt {
         $result = array( 'body' => '',
                          'curl_error' => '',
                          'curl_errno' => 0,
+                         'request_sent' => false,
                          'http_code' => '',
                          'last_url' => '');
         if ($error != "") {
             $result['curl_error'] = $error;
             $result['curl_errno'] = curl_errno($curl);
+            // PRETRANSFER is reached once the connection is up and the request goes out
+            $result['request_sent'] = curl_getinfo($curl, CURLINFO_PRETRANSFER_TIME) > 0;
             return $result;
         }
 

@@ -113,6 +113,8 @@ final class WCMConnectorTest extends TestCase
             'UpdateInterval' => 60,
             'FirstHK' => 2,
             'LastHK' => 3,
+            // No pause between blocks, keeps the tests fast
+            'BlockPause' => 0,
         ]);
         $module->ApplyChanges();
 

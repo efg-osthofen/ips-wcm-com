@@ -7,6 +7,8 @@
         { "type": "NumberSpinner", "name": "UpdateInterval", "caption": "Update Intervall", "suffix": "seconds" },
         { "type": "NumberSpinner", "name": "FirstHK", "caption": "Nummer des ersten Heizkreises" },
         { "type": "NumberSpinner", "name": "LastHK", "caption": "Nummer des letzten Heizkreises" },
-        { "type": "NumberSpinner", "name": "SlowParameterInterval", "caption": "Lesetakt seltener Parameter (0 = jeder Zyklus)", "suffix": "minutes", "minimum": 0 }
+        { "type": "NumberSpinner", "name": "SlowParameterInterval", "caption": "Lesetakt seltener Parameter (0 = jeder Zyklus)", "suffix": "minutes", "minimum": 0 },
+        { "type": "NumberSpinner", "name": "BlockPause", "caption": "Pause zwischen Blöcken", "suffix": "ms", "minimum": 0 },
+        { "type": "NumberSpinner", "name": "BlockSize", "caption": "Telegramme pro Block", "minimum": 1, "maximum": 9 }
     ]
 }

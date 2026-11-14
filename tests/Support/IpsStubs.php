@@ -26,6 +26,9 @@ final class IpsFake
     /** @var array<string, true> */
     public static array $semaphores = [];
 
+    /** @var list<int> milliseconds passed to every IPS_SemaphoreEnter call */
+    public static array $semaphoreWaits = [];
+
     /** @var list<array{instance:int, message:string, type:int}> */
     public static array $log = [];
 
@@ -47,6 +50,7 @@ final class IpsFake
         self::$timers = [];
         self::$profiles = [];
         self::$semaphores = [];
+        self::$semaphoreWaits = [];
         self::$log = [];
         self::$debug = [];
         self::$buffers = [];
@@ -309,6 +313,7 @@ function GetValue(int $variableId)
 /** Non-blocking: a held semaphore fails immediately instead of waiting. */
 function IPS_SemaphoreEnter(string $name, int $milliseconds): bool
 {
+    IpsFake::$semaphoreWaits[] = $milliseconds;
     if (isset(IpsFake::$semaphores[$name])) {
         return false;
     }

@@ -107,7 +107,7 @@ if ($scenario['auth']) {
 
     $nonces[$digest['nonce']]++;
     saveNonces($stateDir, $nonces);
-    logLine("$stateDir/auth.jsonl", ['status' => 200, 'nonce' => $digest['nonce'], 'nc' => $digest['nc']]);
+    logLine("$stateDir/auth.jsonl", ['status' => 200, 'nonce' => $digest['nonce'], 'nc' => $digest['nc'], 'time' => microtime(true)]);
 }
 
 $request = json_decode(file_get_contents('php://input'), true);

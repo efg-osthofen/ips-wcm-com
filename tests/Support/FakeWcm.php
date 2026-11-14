@@ -136,7 +136,7 @@ final class FakeWcm
         );
     }
 
-    /** @return list<array{status:int, stale?:bool, nonce?:string, nc?:string}> every request with its authentication outcome */
+    /** @return list<array{status:int, stale?:bool, nonce?:string, nc?:string, time?:float}> every request with its authentication outcome */
     public static function authLog(): array
     {
         $file = self::$stateDir . '/auth.jsonl';
@@ -154,6 +154,12 @@ final class FakeWcm
     public static function challenges(): int
     {
         return count(array_filter(self::authLog(), static fn (array $entry) => $entry['status'] === 401));
+    }
+
+    /** @return list<float> arrival time (microtime) of every authenticated request */
+    public static function requestTimes(): array
+    {
+        return array_column(array_filter(self::authLog(), static fn (array $entry) => $entry['status'] === 200), 'time');
     }
 
     /** @return list<string> nonce of every authenticated request */

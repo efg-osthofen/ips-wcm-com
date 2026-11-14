@@ -4,21 +4,29 @@ require __DIR__ . '/../libs/wcm-client/wcm.php';
 class WCMConnector extends IPSModule {
     private const BETRIEBSART_HK_PREFIX = "BetriebsartHeizkreis";
     private const SEMAPHORE = "WCM_Communication";
-    private const SEMAPHORE_TIMEOUT = 10000;
+    /** Writes and switching the updates on wait this long (ms) for a running cycle */
+    private const SEMAPHORE_TIMEOUT = 30000;
+    /** The timer doesn't wait: while a cycle (or a write) is running, the timer run is skipped */
+    private const TIMER_SEMAPHORE_TIMEOUT = 0;
     private const BLOCKED_MESSAGE = "Durch parallele Anfrage blockiert.";
 
-    // Limits for the communication with the WCM-COM, in seconds. A read cycle
-    // must end well before the semaphore timeout (10 s) and the update interval.
+    // Limits for the communication with the WCM-COM, in seconds. The request
+    // timeout is generous, so the WCM-COM doesn't keep working on requests the
+    // module already gave up. A cycle starts no further request after
+    // NEW_REQUEST_LIMIT; overlapping cycles are prevented by the semaphore.
     protected const CONNECT_TIMEOUT = 3.0;
-    protected const REQUEST_TIMEOUT = 8.0;
-    protected const CYCLE_TIME_BUDGET = 8.0;
+    protected const REQUEST_TIMEOUT = 15.0;
+    protected const NEW_REQUEST_LIMIT = 10.0;
+
+    /** Characters of a raw WCM-COM answer shown in the debug output */
+    private const DEBUG_BODY_LENGTH = 500;
 
     /** Pauses after the 1st, 2nd, 3rd and every further failed cycle, in seconds */
     private const PAUSE_STEPS = [60, 120, 300];
 
     /** Parameters that rarely change and are only read every SlowParameterInterval minutes */
-    private const SLOW_HK_PARAMETERS = ["NormalRaumtemperaturHK", "RaumfrosttemperaturHK", "SoWiUmschalttemperaturHK", "SteilheitHK"];
-    private const SLOW_KESSEL_PARAMETERS = ["KesselMaxLeistungHeizung", "KesselMaxLeistungWW"];
+    private const SLOW_HK_PARAMETERS = [self::BETRIEBSART_HK_PREFIX, "NormalRaumtemperaturHK", "RaumfrosttemperaturHK", "SoWiUmschalttemperaturHK", "SteilheitHK"];
+    private const SLOW_KESSEL_PARAMETERS = ["KesselGedaempfteAussentemperatur", "KesselMaxLeistungHeizung", "KesselMaxLeistungWW"];
 
     // Instance buffers (in memory, reset on restart) for the communication state
     private const BUFFER_FAILURES = "FailedCycles";
@@ -36,6 +44,8 @@ class WCMConnector extends IPSModule {
         $this->RegisterPropertyInteger("FirstHK", 2);
         $this->RegisterPropertyInteger("LastHK", 5);
         $this->RegisterPropertyInteger("SlowParameterInterval", 15);
+        $this->RegisterPropertyInteger("BlockPause", 300);
+        $this->RegisterPropertyInteger("BlockSize", 9);
         
         $this->RegisterTimer("Update", 0, "WCM_RetrieveWCMStatus(".$this->InstanceID.", true);");
         
@@ -183,7 +193,7 @@ class WCMConnector extends IPSModule {
     }
 
     public function RetrieveWCMStatus(bool $sendBuffer = true) {
-        if(!IPS_SemaphoreEnter(self::SEMAPHORE, self::SEMAPHORE_TIMEOUT)) {
+        if(!IPS_SemaphoreEnter(self::SEMAPHORE, self::TIMER_SEMAPHORE_TIMEOUT)) {
             // Keep the current values and try again with the next timer run
             $this->SendDebug("RetrieveWCMStatus", "Skipped, WCM-COM is busy with another request", 0);
             return;
@@ -202,7 +212,9 @@ class WCMConnector extends IPSModule {
             $this->ReadPropertyString("Username"),
             $this->ReadPropertyString("Password"),
             static::CONNECT_TIMEOUT,
-            static::REQUEST_TIMEOUT
+            static::REQUEST_TIMEOUT,
+            $this->ReadPropertyInteger("BlockSize"),
+            $this->ReadPropertyInteger("BlockPause") / 1000
         ));
     }
 
@@ -238,7 +250,7 @@ class WCMConnector extends IPSModule {
             $response = $api->sendBuffer(10);
         } catch(WeishauptConnectionException $e) {
             $pause = $this->RegisterFailedCycle();
-            $this->SendDebug("WriteWCM", sprintf("Schreiben fehlgeschlagen (%s): %s | Pause %d s", $this->DescribeError($e), $e->getMessage(), $pause), 0);
+            $this->SendDebug("WriteWCM", sprintf("Schreiben fehlgeschlagen (%s): %s | %s | Pause %d s", $this->DescribeError($e), $e->getMessage(), self::DescribeStats($api->getLastStats()), $pause), 0);
             throw $e;
         }
         $api->clearBuffer();
@@ -307,6 +319,12 @@ class WCMConnector extends IPSModule {
         return false;
     }
 
+    /** Parameters whose value is passed on unscaled and can't be N/V */
+    private function IsRawValue(string $ident): bool {
+        return in_array($ident, ["KesselFehlercode", "KesselLaststellung"], true)
+            || strpos($ident, self::BETRIEBSART_HK_PREFIX) === 0;
+    }
+
     private function AllSlowParametersDue(): bool {
         $readAt = $this->GetBuffer(self::BUFFER_SLOW_READ_AT);
         $interval = $this->ReadPropertyInteger("SlowParameterInterval");
@@ -333,29 +351,73 @@ class WCMConnector extends IPSModule {
         }
     }
 
+    /** Short German description of how a request failed, for the debug output. */
     private function DescribeError(Exception $e): string {
+        if($e instanceof WeishauptConnectTimeoutException) {
+            return "Verbindungs-Timeout";
+        }
+        if($e instanceof WeishauptResponseTimeoutException) {
+            return "Antwort-Timeout";
+        }
         if($e instanceof WeishauptTimeoutException) {
             return "Timeout";
         }
         if($e instanceof WeishauptConnectionException) {
             return "keine Verbindung";
         }
+        if($e instanceof WeishauptHttpException) {
+            return "HTTP-Fehler ".$e->httpCode;
+        }
         if($e instanceof WeishauptBusyException) {
             return "Server busy";
+        }
+        if($e instanceof WeishauptTooSlowException) {
+            return "zu langsam";
+        }
+        if($e instanceof WeishauptResponseException) {
+            switch($e->kind) {
+                case "incomplete":
+                    return "unvollständige Antwort";
+                case "mismatch":
+                    return "unpassende Antwort";
+            }
+            return "ungültige Antwort";
+        }
+        if($e instanceof JsonException) {
+            return "ungültige Antwort";
         }
         return "Fehlerhafte Antwort";
     }
 
+    private static function FormatSeconds(float $seconds): string {
+        return number_format($seconds, 2, ",", "");
+    }
+
     private static function DescribeStats(array $stats): string {
         return sprintf(
-            "%d Telegramme, %d/%d Blöcke, %d HTTP-Anfragen, %d Verbindung(en), %s s",
+            "%d Telegramme, %d/%d Blöcke (%s s), %d HTTP-Anfragen, %d Verbindung(en), %s s",
             $stats["telegrams"],
             $stats["sent_blocks"],
             $stats["blocks"],
+            implode(" + ", array_map([self::class, "FormatSeconds"], $stats["block_durations"])),
             $stats["http_requests"],
             $stats["connections"],
-            number_format($stats["duration"], 2, ",", "")
+            self::FormatSeconds($stats["duration"])
         );
+    }
+
+    /** The last raw answer of the WCM-COM, shortened for the debug output. */
+    private static function DescribeAnswer(array $stats): string {
+        if($stats["body"] === null) {
+            return "Keine Antwort des WCM-COM";
+        }
+        $body = $stats["body"];
+        if($body === "") {
+            $body = "(leer)";
+        } elseif(strlen($body) > self::DEBUG_BODY_LENGTH) {
+            $body = substr($body, 0, self::DEBUG_BODY_LENGTH)." … (".strlen($stats["body"])." Zeichen)";
+        }
+        return sprintf("Letzte Antwort des WCM-COM (HTTP %d): %s", $stats["http_code"], $body);
     }
 
     // --- Reading ------------------------------------------------------------
@@ -398,7 +460,8 @@ class WCMConnector extends IPSModule {
     }
 
     /**
-     * Reads the values from the WCM-COM (one attempt, limited in time).
+     * Reads the values from the WCM-COM (one attempt, no new request after
+     * NEW_REQUEST_LIMIT seconds).
      *
      * Slow parameters are only read when they are due; in the other cycles
      * they keep their value. A failed cycle sets all values to 0, disables
@@ -439,28 +502,37 @@ class WCMConnector extends IPSModule {
         }
 
         try {
-            $response = $api->sendBuffer(1, static::CYCLE_TIME_BUDGET);
+            $response = $api->sendBuffer(1, static::NEW_REQUEST_LIMIT);
         } catch(Exception $e) {
-            $this->LogMessage($e->getMessage(), KL_ERROR);
-
-            // Real failure: all values (also the slow ones not read in this cycle) become invalid
-            foreach(array_keys($requests) as $ident) {
-                $this->SetWCMValue($ident, 0, false);
-            }
-
-            $pause = $this->RegisterFailedCycle();
-            $this->SendDebug("RetrieveWCMStatus", sprintf(
-                "Zyklus fehlgeschlagen (%s): %s | %s | Pause %d s (Fehler Nr. %s)",
-                $this->DescribeError($e),
-                $e->getMessage(),
-                self::DescribeStats($api->getLastStats()),
-                $pause,
-                $this->GetBuffer(self::BUFFER_FAILURES)
-            ), 0);
+            $stats = $api->getLastStats();
+            $where = $stats["failed_block"] === null ? "" : sprintf(" in Block %d/%d", $stats["failed_block"], $stats["blocks"]);
+            $this->FailCycle($requests, $stats, $this->DescribeError($e).$where, $e->getMessage());
             return;
         }
 
         $telegrams = $response->getIterator();
+
+        // Count ERROR and N/V answers. If no measured value is valid, the WCM-COM
+        // answers but its eBus side doesn't deliver: that is an outage as well,
+        // not a list of missing sensors. Raw values (Fehlercode, Laststellung,
+        // Betriebsart) can't report N/V and therefore don't count as valid here.
+        $errors = 0;
+        $notAvailable = 0;
+        $valid = 0;
+        foreach($bufferPositions as $key => $value) {
+            if(!isset($telegrams[$value]) || $telegrams[$value]->ERROR) {
+                $errors++;
+            } elseif($telegrams[$value]->NOT_AVAILABLE) {
+                $notAvailable++;
+            } elseif(!$this->IsRawValue($key)) {
+                $valid++;
+            }
+        }
+        if($valid === 0 && $errors + $notAvailable > 0) {
+            $this->FailCycle($requests, $api->getLastStats(), "nur ERROR/N/V", sprintf("WCM-COM lieferte keine gültigen Werte (%d ERROR, %d N/V).", $errors, $notAvailable));
+            return;
+        }
+
         foreach($bufferPositions as $key => $value) {
             if(!isset($telegrams[$value])) {
                 $this->SetWCMValue($key, 0, false);
@@ -485,9 +557,34 @@ class WCMConnector extends IPSModule {
         }
 
         $this->SendDebug("RetrieveWCMStatus", sprintf(
-            "Zyklus OK: %s, seltene Parameter: %s",
+            "Zyklus OK: %s, ERROR %d, N/V %d, seltene Parameter: %s",
             self::DescribeStats($api->getLastStats()),
+            $errors,
+            $notAvailable,
             $readAllSlow ? "alle" : ($slowRead > 0 ? $slowRead." nach Schreiben" : "keine")
+        ), 0);
+    }
+
+    /**
+     * A failed cycle: logs the error, sets all values (also the slow ones not
+     * read in this cycle) to 0, disables them and starts the pause.
+     */
+    private function FailCycle(array $requests, array $stats, string $kind, string $message) {
+        $this->LogMessage($message, KL_ERROR);
+
+        foreach(array_keys($requests) as $ident) {
+            $this->SetWCMValue($ident, 0, false);
+        }
+
+        $pause = $this->RegisterFailedCycle();
+        $this->SendDebug("RetrieveWCMStatus", self::DescribeAnswer($stats), 0);
+        $this->SendDebug("RetrieveWCMStatus", sprintf(
+            "Zyklus fehlgeschlagen (%s): %s | %s | Pause %d s (Fehler Nr. %s)",
+            $kind,
+            $message,
+            self::DescribeStats($stats),
+            $pause,
+            $this->GetBuffer(self::BUFFER_FAILURES)
         ), 0);
     }
     

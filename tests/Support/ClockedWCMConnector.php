@@ -12,7 +12,7 @@ final class ClockedWCMConnector extends \WCMConnector
 {
     protected const CONNECT_TIMEOUT = 0.5;
     protected const REQUEST_TIMEOUT = 0.5;
-    protected const CYCLE_TIME_BUDGET = 2.0;
+    protected const NEW_REQUEST_LIMIT = 2.0;
 
     public float $now = 1000000.0;
 
